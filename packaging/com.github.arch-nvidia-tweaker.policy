@@ -5,7 +5,7 @@
 <policyconfig>
 
   <vendor>Arch NVIDIA Tweaker</vendor>
-  <vendor_url>https://github.com/arch-nvidia-tweaker/arch-nvidia-tweaker</vendor_url>
+  <vendor_url>https://github.com/archledger/arch-nvidia-tweaker</vendor_url>
 
   <action id="com.github.arch-nvidia-tweaker">
     <description>Configure NVIDIA, Wayland, power, and gaming settings</description>
