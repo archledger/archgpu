@@ -1,0 +1,345 @@
+use anyhow::Result;
+use slint::{ComponentHandle, SharedString};
+use std::thread;
+
+use crate::core::auto;
+use crate::core::bootloader::{self, BootloaderType};
+use crate::core::diagnostics::{self, Severity};
+use crate::core::gaming;
+use crate::core::gpu::{GpuInventory, PackageSource};
+use crate::core::hardware::{self, FormFactor};
+use crate::core::power;
+use crate::core::wayland;
+use crate::core::{self, Actions, Context, ExecutionMode, SystemPaths};
+
+slint::include_modules!();
+
+pub fn run() -> Result<()> {
+    let ui = MainWindow::new()?;
+
+    populate_detection(&ui);
+    append_log(
+        &ui,
+        "Arch NVIDIA Tweaker — ready. Click Auto-Optimize for a one-click recommendation, or tune toggles manually and hit Preview/Apply.",
+    );
+
+    // ── Refresh detection ────────────────────────────────────────────────────────────────────
+    {
+        let weak = ui.as_weak();
+        ui.on_detect(move || {
+            if let Some(ui) = weak.upgrade() {
+                populate_detection(&ui);
+                append_log(&ui, "Detection refreshed.");
+            }
+        });
+    }
+
+    // ── Auto-Optimize (hero button) ──────────────────────────────────────────────────────────
+    {
+        let weak = ui.as_weak();
+        ui.on_auto_optimize(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let ctx = Context::production(ExecutionMode::DryRun);
+            let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+            let gpus = GpuInventory::detect().unwrap_or_default();
+
+            let rec = auto::recommend(&ctx, form, &gpus);
+            ui.set_opt_wayland(rec.wayland);
+            ui.set_opt_bootloader(rec.bootloader);
+            ui.set_opt_power(rec.power);
+            ui.set_opt_gaming(rec.gaming);
+
+            let names = auto::recommended_names(rec);
+            if names.is_empty() {
+                append_log(
+                    &ui,
+                    "Auto-Optimize: system is already well-configured — nothing to do.",
+                );
+            } else {
+                append_log(
+                    &ui,
+                    &format!(
+                        "Auto-Optimize: selected {} action(s) — {}. Review, then click {}.",
+                        names.len(),
+                        names.join(", "),
+                        if ui.get_opt_dry_run() {
+                            "Preview"
+                        } else {
+                            "Apply Selected"
+                        }
+                    ),
+                );
+            }
+        });
+    }
+
+    // ── Diagnostics scan ─────────────────────────────────────────────────────────────────────
+    {
+        let weak = ui.as_weak();
+        ui.on_diagnose(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_is_working(true);
+            append_log(&ui, "--- Diagnostics scan ---");
+
+            let thread_weak = ui.as_weak();
+            thread::spawn(move || {
+                let ctx = Context::production(ExecutionMode::DryRun);
+                let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+                let gpus = GpuInventory::detect().unwrap_or_default();
+                let findings = diagnostics::scan(&ctx, &gpus, form);
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = thread_weak.upgrade() {
+                        let (mut i, mut w, mut e) = (0u32, 0u32, 0u32);
+                        for f in &findings {
+                            match f.severity {
+                                Severity::Info => i += 1,
+                                Severity::Warning => w += 1,
+                                Severity::Error => e += 1,
+                            }
+                            append_log(&ui, &format!("{} {}", f.severity.marker(), f.title));
+                            if !f.detail.is_empty() {
+                                append_log(&ui, &format!("       {}", f.detail));
+                            }
+                            if let Some(fix) = &f.fix_hint {
+                                append_log(&ui, &format!("  fix: {fix}"));
+                            }
+                        }
+                        append_log(
+                            &ui,
+                            &format!("Summary: {i} info / {w} warnings / {e} errors."),
+                        );
+                        ui.set_is_working(false);
+                    }
+                });
+            });
+        });
+    }
+
+    // ── Apply / Preview ──────────────────────────────────────────────────────────────────────
+    // Phase 6 live-streaming pattern preserved: the progress callback pipes each pacman /
+    // mkinitcpio / grub-mkconfig / bootctl / makepkg / yay line into the log through
+    // slint::invoke_from_event_loop, while the heavy work runs on a worker thread. Phase 11
+    // adds: after the run finishes, we re-poll state so the [✓ Applied] badges update.
+    {
+        let weak = ui.as_weak();
+        ui.on_apply(move || {
+            let Some(ui) = weak.upgrade() else { return };
+
+            let actions = Actions {
+                wayland: ui.get_opt_wayland(),
+                bootloader: ui.get_opt_bootloader(),
+                power: ui.get_opt_power(),
+                gaming: ui.get_opt_gaming(),
+            };
+            if !actions.any() {
+                append_log(&ui, "No actions selected — nothing to do.");
+                return;
+            }
+
+            let mode = if ui.get_opt_dry_run() {
+                ExecutionMode::DryRun
+            } else {
+                ExecutionMode::Apply
+            };
+            let assume_yes = ui.get_opt_assume_yes();
+
+            ui.set_is_working(true);
+            append_log(
+                &ui,
+                &format!(
+                    "--- Running {} actions ---",
+                    if mode.is_dry_run() {
+                        "dry-run"
+                    } else {
+                        "apply"
+                    }
+                ),
+            );
+
+            let thread_weak = ui.as_weak();
+            thread::spawn(move || {
+                let ctx = Context::production(mode);
+                let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+                let gpus = GpuInventory::detect().unwrap_or_default();
+
+                let progress_weak = thread_weak.clone();
+                let mut progress = move |line: &str| {
+                    let weak = progress_weak.clone();
+                    let line = line.to_string();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() {
+                            append_log(&ui, &line);
+                        }
+                    });
+                };
+
+                let result =
+                    core::run_actions(&ctx, form, &gpus, actions, assume_yes, &mut progress);
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = thread_weak.upgrade() {
+                        match result {
+                            Ok(reports) => {
+                                let mut last_section: &str = "";
+                                for (section, r) in reports {
+                                    if section != last_section {
+                                        append_log(&ui, &format!("[{section}]"));
+                                        last_section = section;
+                                    }
+                                    append_log(&ui, &format!("  {r}"));
+                                }
+                                append_log(&ui, "Done.");
+                            }
+                            Err(e) => {
+                                append_log(&ui, &format!("ERROR: {e:#}"));
+                            }
+                        }
+                        // Re-poll state so [✓ Applied] badges update without needing a detect click.
+                        populate_detection(&ui);
+                        ui.set_is_working(false);
+                    }
+                });
+            });
+        });
+    }
+
+    ui.run()?;
+    Ok(())
+}
+
+fn populate_detection(ui: &MainWindow) {
+    let paths = SystemPaths::production();
+    let ctx = Context::production(ExecutionMode::DryRun);
+
+    let (chassis_desc, is_laptop, form) = match hardware::detect(&paths.dmi_chassis) {
+        Ok(FormFactor::Laptop) => ("Laptop".to_string(), true, FormFactor::Laptop),
+        Ok(FormFactor::Desktop) => ("Desktop".to_string(), false, FormFactor::Desktop),
+        Ok(FormFactor::Unknown) => (
+            "Unknown form factor".to_string(),
+            false,
+            FormFactor::Unknown,
+        ),
+        Err(e) => (format!("detection failed: {e}"), false, FormFactor::Unknown),
+    };
+    ui.set_chassis_text(SharedString::from(chassis_desc));
+    ui.set_is_laptop(is_laptop);
+
+    let gpus = GpuInventory::detect().unwrap_or_default();
+    let has_nvidia = gpus.has_nvidia();
+    ui.set_has_nvidia(has_nvidia);
+    ui.set_is_hybrid(gpus.is_hybrid());
+    ui.set_gpus_text(SharedString::from(format_gpu_inventory(&gpus)));
+
+    // Bootloader type + source path
+    let bt = bootloader::detect_active_bootloader(&ctx);
+    ui.set_bootloader_type_text(SharedString::from(bt.human()));
+    let bootloader_desc = describe_bootloader_source(&ctx, bt);
+    ui.set_bootloader_text(SharedString::from(bootloader_desc));
+
+    // Per-tweak state flags → drives the Switch disabled-state + [✓ Applied] / Unsupported badges.
+    apply_tweak_states(ui, &ctx, &gpus);
+
+    // Pre-arm toggles from a real recommendation so startup ≡ Auto-Optimize.
+    let recommended = auto::recommend(&ctx, form, &gpus);
+    ui.set_opt_wayland(recommended.wayland);
+    ui.set_opt_bootloader(recommended.bootloader);
+    ui.set_opt_power(recommended.power);
+    ui.set_opt_gaming(recommended.gaming);
+}
+
+fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
+    let w = wayland::check_state(ctx, gpus);
+    ui.set_state_wayland_applied(w.is_applied());
+    ui.set_state_wayland_incompatible(w.is_incompatible());
+
+    let b = bootloader::check_state(ctx, gpus);
+    ui.set_state_bootloader_applied(b.is_applied());
+    ui.set_state_bootloader_incompatible(b.is_incompatible());
+
+    let p = power::check_state(ctx, gpus);
+    ui.set_state_power_applied(p.is_applied());
+    ui.set_state_power_incompatible(p.is_incompatible());
+
+    let g = gaming::check_state(ctx, gpus);
+    ui.set_state_gaming_applied(g.is_applied());
+}
+
+fn describe_bootloader_source(ctx: &Context, bt: BootloaderType) -> String {
+    match bt {
+        BootloaderType::Uki => format!("cmdline at {}", ctx.paths.kernel_cmdline.display()),
+        BootloaderType::Grub => format!("cmdline at {}", ctx.paths.grub_default.display()),
+        BootloaderType::SystemdBoot => format!("entries at {}", ctx.paths.sdb_entries.display()),
+        BootloaderType::Limine => ctx
+            .paths
+            .limine_candidates
+            .iter()
+            .find(|p| p.exists())
+            .map(|p| format!("cmdline in {}", p.display()))
+            .unwrap_or_else(|| "limine.conf not found".to_string()),
+        BootloaderType::Unknown => "no supported bootloader detected".to_string(),
+    }
+}
+
+fn format_gpu_inventory(gpus: &GpuInventory) -> String {
+    if gpus.gpus.is_empty() {
+        return "(no display controllers detected)".to_string();
+    }
+    let mut lines = Vec::new();
+    for g in &gpus.gpus {
+        let mut line = format!(
+            "• {:?}  {}{}",
+            g.vendor,
+            g.display_name(),
+            if g.is_integrated {
+                "   (integrated)"
+            } else {
+                ""
+            }
+        );
+        if let Some(gen) = g.nvidia_gen {
+            line.push_str(&format!("\n    arch: {}", gen.human()));
+        }
+        if let Some(rec) = g.recommended_nvidia_package() {
+            let tag = match rec.source {
+                PackageSource::Official => "repo",
+                PackageSource::Aur => "AUR",
+                PackageSource::Unsupported => "EOL",
+            };
+            line.push_str(&format!(
+                "\n    driver: {} ({tag}) — {}",
+                rec.package, rec.note
+            ));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn append_log(ui: &MainWindow, line: &str) {
+    let mut buf = ui.get_log_text().to_string();
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(line);
+    ui.set_log_text(SharedString::from(buf));
+    log::info!("{line}");
+
+    // Phase 11 auto-scroll (post-bugfix):
+    //
+    // Primary trigger is the Slint-side `changed viewport-height` handler on the ScrollView
+    // — it fires AFTER Slint's layout pass recomputes the Text's intrinsic height, so
+    // viewport-height is guaranteed current and the snap lands on the true new bottom.
+    //
+    // Belt-and-suspenders: we ALSO explicitly invoke the public scroll function, but deferred
+    // through `invoke_from_event_loop`. That pushes the call onto the next event-loop tick,
+    // giving Slint a chance to process `set_log_text` and re-layout before we read
+    // viewport-height in the function. Without this deferral, calling invoke_* synchronously
+    // here would read the pre-append viewport-height and land one frame short of the bottom.
+    let weak = ui.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_scroll_console_to_end();
+        }
+    });
+}

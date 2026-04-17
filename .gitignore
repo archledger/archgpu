@@ -1,0 +1,41 @@
+# ── Rust build artifacts ─────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is INTENTIONALLY committed — this is a binary crate, and a locked
+# dependency graph is what makes `cargo build --locked` reproducible during
+# `makepkg`. Do not uncomment.
+# Cargo.lock
+
+# ── makepkg working + output artifacts (inside packaging/) ───────────────────
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.zst
+/packaging/*.pkg.tar.xz
+/packaging/*.pkg.tar.gz
+/packaging/*.tar.gz
+/packaging/*.tar.xz
+/packaging/*.sig
+
+# ── Slint / build.rs-generated artifacts ─────────────────────────────────────
+# Slint's slint-build dumps its generated Rust under target/; already covered
+# by /target/ above. Belt-and-suspenders for any stray .ron caches.
+*.ron
+
+# ── IDE / editor cruft ───────────────────────────────────────────────────────
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# ── OS metadata ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Local overrides ──────────────────────────────────────────────────────────
+/.cargo/
+/.direnv/

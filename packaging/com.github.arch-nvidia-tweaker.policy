@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Arch NVIDIA Tweaker</vendor>
+  <vendor_url>https://github.com/arch-nvidia-tweaker/arch-nvidia-tweaker</vendor_url>
+
+  <action id="com.github.arch-nvidia-tweaker">
+    <description>Configure NVIDIA, Wayland, power, and gaming settings</description>
+    <description xml:lang="en_GB">Configure NVIDIA, Wayland, power, and gaming settings</description>
+    <message>Authentication is required to modify /etc/ and run pacman.</message>
+    <message xml:lang="en_GB">Authentication is required to modify /etc/ and run pacman.</message>
+
+    <defaults>
+      <!-- Prompt for the administrator password; cache the authorization for the default
+           polkit timeout so that follow-up actions from within the same GUI run don't
+           re-prompt. -->
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/arch-nvidia-tweaker</annotate>
+
+    <!-- Preserve the graphical session env when pkexec drops into root. Without this,
+         pkexec sanitizes DISPLAY/WAYLAND_DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR and the
+         Slint backend cannot connect to the user's compositor socket. -->
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

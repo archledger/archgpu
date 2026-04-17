@@ -1,0 +1,501 @@
+// Phase 8 UI + Phase 11 state feedback + auto-scroll console.
+//
+// Key additions in Phase 11:
+//  - TweakRow grows `applied` and `incompatible` properties. When a tweak is already
+//    Applied, the Switch is disabled and a green "✓ Applied" badge appears in-row. When
+//    it is Incompatible (e.g. NVIDIA tweak on non-NVIDIA host), the Switch is disabled
+//    and an "unsupported" label appears instead.
+//  - Hardware card shows the detected BootloaderType (GRUB / systemd-boot / Limine / UKI).
+//  - Console is now a ScrollView wrapping a monospace Text (not TextEdit). A public
+//    `scroll-console-to-end()` function, deferred through a Timer to give Slint's layout
+//    a frame to measure the new viewport-height, snaps viewport-y to the bottom — but
+//    only if the user is already near the bottom OR at the very top (initial state). If
+//    the user has scrolled UP into the history, we respect that and don't snap.
+
+import {
+    Button,
+    HorizontalBox,
+    ScrollView,
+    Switch,
+    VerticalBox,
+} from "std-widgets.slint";
+
+// ── Reusable card container ──────────────────────────────────────────────────────────────────
+component Card inherits Rectangle {
+    in property <color> fill: #242424;
+    background: fill;
+    border-radius: 12px;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        @children
+    }
+}
+
+// ── Hero primary action button (GNOME Blue) ──────────────────────────────────────────────────
+component HeroButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 48px;
+    border-radius: 10px;
+    background: !root.enabled
+        ? #2A4A74
+        : (ta.pressed ? #2D6EC2 : (ta.has-hover ? #4794F0 : #3584E4));
+    animate background { duration: 140ms; easing: ease-in-out; }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        padding: 14px;
+        Text {
+            text: root.text;
+            color: root.enabled ? #FFFFFF : #B8C7DC;
+            font-size: 15px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Secondary button (dark filled, optional primary tint) ────────────────────────────────────
+component SecondaryButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    callback clicked();
+
+    height: 38px;
+    border-radius: 8px;
+    background: !root.enabled
+        ? #2A2A2A
+        : root.primary
+            ? (sta.pressed ? #2D6EC2 : (sta.has-hover ? #4794F0 : #3584E4))
+            : (sta.pressed ? #3A3A3A : (sta.has-hover ? #333333 : #2F2F2F));
+    animate background { duration: 120ms; }
+
+    sta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        Text {
+            text: root.text;
+            color: root.enabled ? #FFFFFF : #808080;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Small status badge ──────────────────────────────────────────────────────────────────────
+component StateBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> fill;
+    in property <color> text-color: #0A0A0A;
+    background: root.fill;
+    border-radius: 6px;
+    height: 22px;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: root.text-color;
+            font-size: 10px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Tweak row: bold title + gray subtitle on the left, Switch (or status badge) on right ────
+component TweakRow inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+
+    // Phase 11 state flags
+    in property <bool> applied: false;
+    in property <bool> incompatible: false;
+
+    spacing: 16px;
+    alignment: stretch;
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 3px;
+        alignment: center;
+
+        Text {
+            text: root.title;
+            color: (root.enabled && !root.incompatible) ? #FFFFFF : #8A8A8A;
+            font-size: 14px;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.incompatible
+                ? "Unsupported on this host."
+                : (root.applied
+                    ? "Already applied — leave toggled off unless you want to redo it."
+                    : root.subtitle);
+            color: root.incompatible ? #E8944B : #A0A0A0;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 4px;
+
+        // Applied → green badge (switch disabled)
+        if root.applied : StateBadge {
+            text: "✓ Applied";
+            fill: #2E5C3A;
+            text-color: #C8F5D4;
+        }
+        // Incompatible → orange badge (switch disabled)
+        if root.incompatible : StateBadge {
+            text: "Unsupported";
+            fill: #5C412E;
+            text-color: #F5D4BB;
+        }
+        // Normal → Switch
+        if !root.applied && !root.incompatible : Switch {
+            checked <=> root.checked;
+            enabled: root.enabled;
+        }
+    }
+}
+
+// ── Main window ─────────────────────────────────────────────────────────────────────────────
+export component MainWindow inherits Window {
+    title: "Arch NVIDIA Tweaker";
+    background: #1E1E1E;
+    default-font-family: "Inter";
+    preferred-width: 820px;
+    preferred-height: 820px;
+    min-width: 640px;
+    min-height: 580px;
+
+    // ── Selection state (toggles) ───────────────────────────────────────────────────────────
+    in-out property <bool> opt-wayland: false;
+    in-out property <bool> opt-bootloader: false;
+    in-out property <bool> opt-power: false;
+    in-out property <bool> opt-gaming: false;
+    in-out property <bool> opt-dry-run: true;
+    in-out property <bool> opt-assume-yes: true;
+
+    // ── Phase 11 per-tweak state flags (filled by gui::populate_detection) ─────────────────
+    in-out property <bool> state-wayland-applied: false;
+    in-out property <bool> state-wayland-incompatible: false;
+    in-out property <bool> state-bootloader-applied: false;
+    in-out property <bool> state-bootloader-incompatible: false;
+    in-out property <bool> state-power-applied: false;
+    in-out property <bool> state-power-incompatible: false;
+    in-out property <bool> state-gaming-applied: false;
+
+    // ── Detection text (read from Rust) ────────────────────────────────────────────────────
+    in-out property <string> chassis-text: "Detecting...";
+    in-out property <string> bootloader-text: "Detecting...";
+    in-out property <string> bootloader-type-text: "Detecting...";
+    in-out property <string> gpus-text: "Detecting...";
+    in-out property <bool> is-laptop: false;
+    in-out property <bool> has-nvidia: false;
+    in-out property <bool> is-hybrid: false;
+
+    // ── Run state ──────────────────────────────────────────────────────────────────────────
+    in-out property <string> log-text: "";
+    in-out property <bool> is-working: false;
+
+    // ── Callbacks into Rust ────────────────────────────────────────────────────────────────
+    callback apply();
+    callback detect();
+    callback diagnose();
+    callback auto-optimize();
+
+    // ── Console auto-scroll plumbing ───────────────────────────────────────────────────────
+    // Kept as a public function for Rust to invoke belt-and-suspenders style after every
+    // append_log. The main reactive behavior is on the ScrollView itself (see the `changed
+    // viewport-height` handler below) — Slint emits that event AFTER the layout pass has
+    // recomputed the Text's intrinsic height, so viewport-height is guaranteed current at
+    // that point. Both paths assign the same target, so invoking this explicitly is safe.
+    public function scroll-console-to-end() {
+        console-scroll.viewport-y = min(0px, console-scroll.visible-height - console-scroll.viewport-height);
+    }
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        // Scrollable main content region -----------------------------------------------------
+        ScrollView {
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+            viewport-width: self.visible-width;
+
+            VerticalLayout {
+                spacing: 12px;
+
+                // ── HERO / Header ──────────────────────────────────────────────────────────
+                Card {
+                    fill: #1F2A3A;
+
+                    Text {
+                        text: "Arch NVIDIA Tweaker";
+                        color: #FFFFFF;
+                        font-size: 26px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Detect your hardware, tune NVIDIA / Wayland / gaming, and install the right packages — safely.";
+                        color: #B8C0CC;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 4px; background: transparent; }
+                    HeroButton {
+                        text: "✨  Auto-Optimize (Recommended)";
+                        enabled: !root.is-working;
+                        clicked => { root.auto-optimize(); }
+                    }
+                    Text {
+                        text: "Scans your GPU, chassis, pacman.conf, and bootloader, then selects ONLY the toggles that are applicable to this host AND not yet applied.";
+                        color: #8A94A6;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+
+                // ── HARDWARE card ──────────────────────────────────────────────────────────
+                Card {
+                    Text {
+                        text: "Detected hardware";
+                        color: #FFFFFF;
+                        font-size: 15px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Chassis:  " + root.chassis-text;
+                        color: #C8C8C8;
+                        font-size: 13px;
+                    }
+                    Text {
+                        text: root.gpus-text;
+                        color: #A0A0A0;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "Bootloader:  " + root.bootloader-type-text + "  ·  " + root.bootloader-text;
+                        color: #A0A0A0;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 6px; background: transparent; }
+                    Text {
+                        text: root.has-nvidia
+                            ? (root.is-hybrid
+                                ? "● NVIDIA + integrated iGPU (hybrid / Optimus)"
+                                : "● NVIDIA dGPU present")
+                            : "● No NVIDIA GPU — NVIDIA-specific actions will be skipped";
+                        color: root.has-nvidia ? #7CC47C : #E8944B;
+                        font-weight: 700;
+                        font-size: 12px;
+                    }
+                }
+
+                // ── TWEAKS card ────────────────────────────────────────────────────────────
+                Card {
+                    Text {
+                        text: "Tweaks";
+                        color: #FFFFFF;
+                        font-size: 15px;
+                        font-weight: 700;
+                    }
+
+                    TweakRow {
+                        title: "Wayland environment + initramfs modules";
+                        subtitle: "Sets GBM_BACKEND / LIBVA_DRIVER_NAME / __GLX_VENDOR_LIBRARY_NAME and adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to the initramfs for early KMS. Hybrid hosts also get a PRIME outputclass Xorg drop-in.";
+                        checked <=> root.opt-wayland;
+                        enabled: !root.is-working;
+                        applied: root.state-wayland-applied;
+                        incompatible: root.state-wayland-incompatible;
+                    }
+
+                    Rectangle { height: 1px; background: #333333; }
+
+                    TweakRow {
+                        title: "Kernel command line (nvidia-drm.modeset=1)";
+                        subtitle: "Required for NVIDIA on Wayland. Writes to the active bootloader's cmdline source (GRUB / systemd-boot / Limine / UKI) and runs the appropriate regeneration command.";
+                        checked <=> root.opt-bootloader;
+                        enabled: !root.is-working;
+                        applied: root.state-bootloader-applied;
+                        incompatible: root.state-bootloader-incompatible;
+                    }
+
+                    Rectangle { height: 1px; background: #333333; }
+
+                    TweakRow {
+                        title: root.is-laptop
+                            ? "Suspend/hibernate fix + hybrid power tweaks  ·  laptop"
+                            : "Suspend/hibernate fix + modprobe tweaks";
+                        subtitle: "Enables nvidia-suspend / nvidia-hibernate / nvidia-resume systemd units, writes NVreg_UseKernelSuspendNotifiers (all hosts) and NVreg_DynamicPowerManagement=0x02 (laptops only), and blacklists nouveau.";
+                        checked <=> root.opt-power;
+                        enabled: !root.is-working;
+                        applied: root.state-power-applied;
+                        incompatible: root.state-power-incompatible;
+                    }
+
+                    Rectangle { height: 1px; background: #333333; }
+
+                    TweakRow {
+                        title: "Gaming setup — multilib, Vulkan, gamemode, mangohud";
+                        subtitle: "Uncomments [multilib], installs per-vendor Vulkan (nvidia-utils / vulkan-intel / vulkan-radeon) + 32-bit variants + gamemode + mangohud, writes vm.max_map_count=1048576, and builds legacy NVIDIA drivers from AUR via yay (auto-bootstrapped) when needed.";
+                        checked <=> root.opt-gaming;
+                        enabled: !root.is-working;
+                        applied: root.state-gaming-applied;
+                        incompatible: false;
+                    }
+                }
+
+                // ── OPTIONS card ───────────────────────────────────────────────────────────
+                Card {
+                    Text {
+                        text: "Options";
+                        color: #FFFFFF;
+                        font-size: 15px;
+                        font-weight: 700;
+                    }
+
+                    TweakRow {
+                        title: "Dry run";
+                        subtitle: "Preview only — no files written, no pacman, no yay, no mkinitcpio. Safe to toggle and explore.";
+                        checked <=> root.opt-dry-run;
+                        enabled: !root.is-working;
+                        applied: false;
+                        incompatible: false;
+                    }
+
+                    Rectangle { height: 1px; background: #333333; }
+
+                    TweakRow {
+                        title: "Pass --noconfirm to pacman";
+                        subtitle: "Required for gaming install from the GUI (no TTY to answer [Y/n] prompts on). yay's internal sudo is routed through SUDO_ASKPASS regardless.";
+                        checked <=> root.opt-assume-yes;
+                        enabled: !root.is-working;
+                        applied: false;
+                        incompatible: false;
+                    }
+                }
+
+                // ── ACTION ROW ─────────────────────────────────────────────────────────────
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: stretch;
+
+                    SecondaryButton {
+                        text: "Refresh detection";
+                        enabled: !root.is-working;
+                        clicked => { root.detect(); }
+                    }
+                    SecondaryButton {
+                        text: "Diagnose";
+                        enabled: !root.is-working;
+                        clicked => { root.diagnose(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    SecondaryButton {
+                        text: root.opt-dry-run ? "Preview" : "Apply Selected";
+                        primary: true;
+                        enabled: !root.is-working;
+                        clicked => { root.apply(); }
+                    }
+                }
+
+                Rectangle { height: 4px; background: transparent; }
+            }
+        }
+
+        // ── CONSOLE card — OUTSIDE scroll, fills remaining vertical space ───────────────────
+        Rectangle {
+            background: #141414;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #2A2A2A;
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+            min-height: 180px;
+            clip: true;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Text {
+                        text: "Console";
+                        color: #FFFFFF;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "live pacman / mkinitcpio / grub-mkconfig / bootctl / makepkg / yay stream";
+                        color: #6A6A6A;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                console-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
+
+                    // Reactive auto-scroll: fires every time the content height changes (a
+                    // new log line was appended, or the Text rewrapped). Slint guarantees
+                    // `changed` runs AFTER the layout pass, so `viewport-height` here is
+                    // the NEW (post-append) content height. Unconditionally snap to the end.
+                    changed viewport-height => {
+                        self.viewport-y = min(0px, self.visible-height - self.viewport-height);
+                    }
+
+                    VerticalLayout {
+                        Text {
+                            text: root.log-text;
+                            color: #DCDCDC;
+                            font-family: "monospace";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            horizontal-alignment: left;
+                            vertical-alignment: top;
+                        }
+                        // Tiny spacer so the last line isn't flush against the bottom edge.
+                        Rectangle { height: 10px; background: transparent; }
+                    }
+                }
+            }
+        }
+    }
+}

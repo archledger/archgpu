@@ -1,0 +1,213 @@
+pub mod aur;
+pub mod auto;
+pub mod bootloader;
+pub mod diagnostics;
+pub mod gaming;
+pub mod gpu;
+pub mod hardware;
+pub mod power;
+pub mod prime;
+pub mod state;
+pub mod wayland;
+
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+
+use anyhow::Result;
+
+use crate::core::hardware::FormFactor;
+use crate::utils::fs_helper::ChangeReport;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Apply,
+    DryRun,
+}
+
+impl ExecutionMode {
+    pub fn is_dry_run(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemPaths {
+    pub profile_d: PathBuf,
+    pub mkinitcpio_d: PathBuf,
+    pub modprobe_d: PathBuf,
+    pub sysctl_d: PathBuf,
+    pub xorg_d: PathBuf,
+    pub kernel_cmdline: PathBuf,
+    pub pacman_conf: PathBuf,
+    pub dmi_chassis: PathBuf,
+    pub backup_dir: PathBuf,
+    // Phase 11: multi-bootloader paths
+    pub grub_default: PathBuf,
+    pub grub_cfg: PathBuf,
+    pub sdb_loader_conf: PathBuf,
+    pub sdb_entries: PathBuf,
+    pub limine_candidates: Vec<PathBuf>,
+}
+
+impl SystemPaths {
+    pub fn production() -> Self {
+        Self {
+            profile_d: PathBuf::from("/etc/profile.d"),
+            mkinitcpio_d: PathBuf::from("/etc/mkinitcpio.conf.d"),
+            modprobe_d: PathBuf::from("/etc/modprobe.d"),
+            sysctl_d: PathBuf::from("/etc/sysctl.d"),
+            xorg_d: PathBuf::from("/etc/X11/xorg.conf.d"),
+            kernel_cmdline: PathBuf::from("/etc/kernel/cmdline"),
+            pacman_conf: PathBuf::from("/etc/pacman.conf"),
+            dmi_chassis: PathBuf::from("/sys/class/dmi/id/chassis_type"),
+            backup_dir: PathBuf::from("/var/backups/arch-nvidia-tweaker"),
+            grub_default: PathBuf::from("/etc/default/grub"),
+            grub_cfg: PathBuf::from("/boot/grub/grub.cfg"),
+            sdb_loader_conf: PathBuf::from("/boot/loader/loader.conf"),
+            sdb_entries: PathBuf::from("/boot/loader/entries"),
+            limine_candidates: vec![
+                PathBuf::from("/boot/limine.conf"),
+                PathBuf::from("/boot/limine/limine.conf"),
+                PathBuf::from("/boot/efi/limine.conf"),
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+impl SystemPaths {
+    pub fn rooted(root: &Path) -> Self {
+        Self {
+            profile_d: root.join("etc/profile.d"),
+            mkinitcpio_d: root.join("etc/mkinitcpio.conf.d"),
+            modprobe_d: root.join("etc/modprobe.d"),
+            sysctl_d: root.join("etc/sysctl.d"),
+            xorg_d: root.join("etc/X11/xorg.conf.d"),
+            kernel_cmdline: root.join("etc/kernel/cmdline"),
+            pacman_conf: root.join("etc/pacman.conf"),
+            dmi_chassis: root.join("sys/class/dmi/id/chassis_type"),
+            backup_dir: root.join("var/backups/arch-nvidia-tweaker"),
+            grub_default: root.join("etc/default/grub"),
+            grub_cfg: root.join("boot/grub/grub.cfg"),
+            sdb_loader_conf: root.join("boot/loader/loader.conf"),
+            sdb_entries: root.join("boot/loader/entries"),
+            limine_candidates: vec![
+                root.join("boot/limine.conf"),
+                root.join("boot/limine/limine.conf"),
+                root.join("boot/efi/limine.conf"),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {
+    pub paths: SystemPaths,
+    pub mode: ExecutionMode,
+}
+
+impl Context {
+    pub fn production(mode: ExecutionMode) -> Self {
+        Self {
+            paths: SystemPaths::production(),
+            mode,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Context {
+    pub fn rooted_for_test(root: &Path, mode: ExecutionMode) -> Self {
+        Self {
+            paths: SystemPaths::rooted(root),
+            mode,
+        }
+    }
+}
+
+/// The set of apply-actions that the caller (CLI or GUI) wants to run.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Actions {
+    pub wayland: bool,
+    pub bootloader: bool,
+    pub power: bool,
+    pub gaming: bool,
+}
+
+impl Actions {
+    pub fn all() -> Self {
+        Self {
+            wayland: true,
+            bootloader: true,
+            power: true,
+            gaming: true,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.wayland || self.bootloader || self.power || self.gaming
+    }
+}
+
+/// Execute the selected actions in order, gating NVIDIA-specific actions on the inventory.
+/// Subprocess output (pacman, mkinitcpio, makepkg, sudo-u yay) is streamed line-by-line into
+/// `progress` so CLI/GUI can surface it live.
+pub fn run_actions(
+    ctx: &Context,
+    form: FormFactor,
+    gpus: &gpu::GpuInventory,
+    actions: Actions,
+    assume_yes: bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Vec<(&'static str, ChangeReport)>> {
+    let mut out = Vec::new();
+    let has_nv = gpus.has_nvidia();
+
+    if actions.wayland {
+        if has_nv {
+            for r in wayland::apply(ctx, gpus)? {
+                out.push(("wayland", r));
+            }
+        } else {
+            out.push((
+                "wayland",
+                skip_non_nvidia("Wayland env + mkinitcpio modules + PRIME"),
+            ));
+        }
+    }
+    if actions.bootloader {
+        if has_nv {
+            out.push(("bootloader", bootloader::apply(ctx, progress)?));
+        } else {
+            out.push((
+                "bootloader",
+                skip_non_nvidia("nvidia-drm.modeset=1 cmdline"),
+            ));
+        }
+    }
+    if actions.power {
+        if has_nv {
+            for r in power::apply(ctx, form)? {
+                out.push(("power", r));
+            }
+        } else {
+            out.push((
+                "power",
+                skip_non_nvidia("nvidia suspend/resume + modprobe + nouveau blacklist"),
+            ));
+        }
+    }
+    if actions.gaming {
+        for r in gaming::apply(ctx, gpus, assume_yes, progress)? {
+            out.push(("gaming", r));
+        }
+    }
+    Ok(out)
+}
+
+fn skip_non_nvidia(what: &str) -> ChangeReport {
+    ChangeReport::AlreadyApplied {
+        detail: format!("skipped {what}: no NVIDIA GPU on this host"),
+    }
+}

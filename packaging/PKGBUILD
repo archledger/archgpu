@@ -1,0 +1,83 @@
+# Maintainer: arch-nvidia-tweaker contributors
+#
+# Build this from the `packaging/` subdirectory:
+#   cd /path/to/arch-nvidia-tweaker/packaging
+#   makepkg -si
+#
+# makepkg's $srcdir is always "$startdir/src" — having PKGBUILD one level down from
+# the project root is what keeps makepkg's working dirs (src/, pkg/) from colliding
+# with the Rust project's own `src/` directory. (The earlier layout with PKGBUILD at
+# the project root was destructive: `makepkg --cleanbuild` wiped the project's src/.)
+
+pkgname=arch-nvidia-tweaker
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Automated NVIDIA/Wayland/power/gaming configurator for Arch Linux (Slint GUI + clap CLI)"
+arch=('x86_64')
+url="https://github.com/arch-nvidia-tweaker/arch-nvidia-tweaker"
+license=('MIT OR Apache-2.0')
+
+depends=(
+    'pciutils'
+    'polkit'
+    'fontconfig'
+    'freetype2'
+    'libxkbcommon'
+    'wayland'
+    'libx11'
+    'libxcb'
+    'libxcursor'
+    'libxi'
+    'libxrandr'
+    'mesa'
+)
+
+makedepends=('rust' 'git')
+
+optdepends=(
+    'mkinitcpio: rebuilding the UKI after cmdline changes (--apply-bootloader)'
+    'nvidia-utils: runtime NVIDIA userspace (ships PRIME outputclass Xorg config)'
+    'nvidia-prime: PRIME render offload wrapper (prime-run) for hybrid graphics'
+    'gamemode: run-time performance tuning (--apply-gaming installs it automatically)'
+    'mangohud: Vulkan/OpenGL perf overlay (--apply-gaming installs it automatically)'
+    'yay: AUR helper for legacy NVIDIA drivers; auto-bootstrapped if missing'
+    'sbctl: Secure Boot key manager (signs UKI via its own mkinitcpio post-hook)'
+    'ksshaskpass: Qt askpass helper for yay under KDE/Plasma/Wayland'
+    'seahorse: GNOME askpass helper (ships /usr/libexec/seahorse/ssh-askpass)'
+)
+
+# Build straight from the working tree at $startdir/.. (the project root). makepkg's own
+# source=() stays empty — no tarball, no git clone, no tar copy into $srcdir. This means
+# we NEVER touch $srcdir (so --cleanbuild wiping it is a no-op for our source), and we
+# reuse the project's own target/ directory for incremental Rust builds.
+source=()
+sha256sums=()
+
+_projectroot() {
+    # $startdir is this packaging/ dir; the Rust project lives one level up.
+    cd "$startdir/.." && pwd -P
+}
+
+build() {
+    cd "$(_projectroot)"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$(_projectroot)"
+    cargo test --release --locked
+}
+
+package() {
+    cd "$(_projectroot)"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 "packaging/$pkgname.desktop" \
+        "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm644 "packaging/com.github.$pkgname.policy" \
+        "$pkgdir/usr/share/polkit-1/actions/com.github.$pkgname.policy"
+
+    for l in LICENSE LICENSE-MIT LICENSE-APACHE LICENSE.txt; do
+        [ -f "$l" ] && install -Dm644 "$l" "$pkgdir/usr/share/licenses/$pkgname/$l"
+    done
+    true
+}
