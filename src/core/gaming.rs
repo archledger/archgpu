@@ -165,20 +165,133 @@ pub fn resolve_gaming_packages(gpus: &GpuInventory) -> Vec<String> {
         add("nvidia-utils");
         add("lib32-nvidia-utils");
         add("nvidia-settings");
+        // Phase 15: VA-API via the NVIDIA-provided backend — required for modern
+        // video acceleration in Firefox, mpv, etc. Replaces the old vdpau-va-gl
+        // shim. Shipped as a separate package from nvidia-utils.
+        add("libva-nvidia-driver");
         if gpus.is_hybrid() {
             add("nvidia-prime");
         }
     }
     if gpus.has_amd() {
+        // RADV (vulkan-radeon) is Mesa's Vulkan driver — faster and more widely
+        // tested in Proton than AMD's own AMDVLK. Sanitation code warns if the
+        // user has amdvlk/lib32-amdvlk installed alongside.
         add("vulkan-radeon");
         add("lib32-vulkan-radeon");
+        // Phase 15: VA-API via Mesa for AMD. Replaces the VDPAU path that Mesa
+        // 25 removed — mesa-vdpau is sanitized-against below.
+        add("libva-mesa-driver");
+        add("lib32-libva-mesa-driver");
     }
     if gpus.has_intel() {
         add("vulkan-intel");
         add("lib32-vulkan-intel");
+        // Phase 15: intel-media-driver (iHD) is the modern Gen8+ VA-API driver.
+        // Gen4-7 hosts need libva-intel-driver (legacy i965) — anyone running this
+        // tool on a Haswell-or-older Intel iGPU in 2026 can install that manually.
+        add("intel-media-driver");
     }
 
     pkgs
+}
+
+// ── Phase 15 Sanitation: detect legacy/conflicting packages ─────────────────────────────────
+
+/// A legacy/conflicting package that should be removed or replaced. Surfaced in the GUI as
+/// a warning banner and in `--diagnose` as a Finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitationWarning {
+    pub title: String,
+    pub detail: String,
+    pub remediation: String,
+}
+
+/// Walk the detected GPU inventory + a snapshot of installed packages, return any sanitation
+/// concerns. Pure function, testable without `pacman`.
+pub fn sanitation_warnings_from_installed(
+    gpus: &GpuInventory,
+    installed: &HashSet<String>,
+) -> Vec<SanitationWarning> {
+    let mut out = Vec::new();
+
+    // The AMDVLK trap — AMDVLK is AMD's official Vulkan driver but in Proton/DXVK
+    // benchmarks RADV (vulkan-radeon, ships with Mesa) is consistently faster and
+    // more widely tested. Worse: if BOTH are installed, applications see two ICDs
+    // and the wrong one may win via VK_ICD_FILENAMES ordering, causing hard-to-
+    // diagnose perf regressions.
+    if gpus.has_amd() {
+        let names: Vec<&str> = ["amdvlk", "lib32-amdvlk"]
+            .into_iter()
+            .filter(|n| installed.contains(*n))
+            .collect();
+        if !names.is_empty() {
+            out.push(SanitationWarning {
+                title: "AMDVLK Vulkan driver installed alongside RADV".into(),
+                detail: format!(
+                    "Found: {}. AMD's official Vulkan driver (AMDVLK) is generally slower than Mesa's RADV \
+                     for gaming under Proton/Steam, and having BOTH installed can let the wrong ICD win.",
+                    names.join(", ")
+                ),
+                remediation: format!(
+                    "sudo pacman -Rns {} (keep vulkan-radeon / lib32-vulkan-radeon — already installed by --apply-gaming)",
+                    names.join(" ")
+                ),
+            });
+        }
+    }
+
+    // The Intel DDX trap — xf86-video-intel has been deprecated upstream for years.
+    // The generic Xorg `modesetting` driver (shipped in xorg-server) is the
+    // recommended path for Gen4+ Intel iGPUs and is what Arch's wiki points to.
+    // The DDX driver causes tearing + hangs on newer kernels, and has no Wayland story.
+    if gpus.has_intel() && installed.contains("xf86-video-intel") {
+        out.push(SanitationWarning {
+            title: "Legacy xf86-video-intel DDX installed".into(),
+            detail: "`xf86-video-intel` was deprecated upstream. The modesetting driver (shipped in \
+                     xorg-server) is the modern replacement for Gen4+ Intel iGPUs — it supports KMS, \
+                     Wayland, and avoids the tearing and hangs the DDX produces on recent kernels."
+                .into(),
+            remediation: "sudo pacman -Rns xf86-video-intel".into(),
+        });
+    }
+
+    // Mesa 25 legacy — VDPAU for the Gallium drivers (AMD / Intel / Nouveau) was
+    // removed in Mesa 25. The `mesa-vdpau` package still exists on Arch for
+    // transition but no longer ships usable drivers; applications should use
+    // VA-API (libva-mesa-driver, intel-media-driver, libva-nvidia-driver) instead.
+    let vdpau_found: Vec<&str> = ["mesa-vdpau", "lib32-mesa-vdpau"]
+        .into_iter()
+        .filter(|n| installed.contains(*n))
+        .collect();
+    if !vdpau_found.is_empty() {
+        out.push(SanitationWarning {
+            title: "Legacy Mesa VDPAU packages installed".into(),
+            detail: format!(
+                "Found: {}. Mesa 25 removed in-tree VDPAU support for Gallium drivers. VA-API \
+                 (libva-mesa-driver / intel-media-driver / libva-nvidia-driver) is the modern path.",
+                vdpau_found.join(", ")
+            ),
+            remediation: format!("sudo pacman -Rns {}", vdpau_found.join(" ")),
+        });
+    }
+
+    out
+}
+
+/// Runtime version that queries pacman for currently-installed packages, then delegates to
+/// the pure `sanitation_warnings_from_installed` for the actual logic.
+pub fn sanitation_warnings(gpus: &GpuInventory) -> Vec<SanitationWarning> {
+    let candidates: &[&str] = &[
+        "amdvlk",
+        "lib32-amdvlk",
+        "xf86-video-intel",
+        "mesa-vdpau",
+        "lib32-mesa-vdpau",
+    ];
+    let owned: Vec<String> = candidates.iter().map(|s| s.to_string()).collect();
+    let installed = pacman_query_installed_set(&owned).unwrap_or_default();
+    sanitation_warnings_from_installed(gpus, &installed)
 }
 
 /// AUR packages the tool will build+install via yay. Empty for Turing+ hosts.
@@ -348,6 +461,28 @@ mod tests {
         let pkgs = resolve_gaming_packages(&inv(vec![intel(0x64a0)]));
         assert!(!pkgs.iter().any(|p| p.starts_with("nvidia")));
         assert!(pkgs.contains(&"vulkan-intel".to_string()));
+        // Phase 15: Intel VA-API via intel-media-driver.
+        assert!(pkgs.contains(&"intel-media-driver".to_string()));
+    }
+
+    #[test]
+    fn amd_gets_libva_mesa_driver() {
+        let pkgs = resolve_gaming_packages(&inv(vec![amd(0x73bf)]));
+        // Phase 15: AMD VA-API via Mesa.
+        assert!(pkgs.contains(&"libva-mesa-driver".to_string()));
+        assert!(pkgs.contains(&"lib32-libva-mesa-driver".to_string()));
+        assert!(pkgs.contains(&"vulkan-radeon".to_string()));
+        assert!(
+            !pkgs.iter().any(|p| p == "amdvlk"),
+            "never recommend AMDVLK"
+        );
+    }
+
+    #[test]
+    fn nvidia_gets_libva_nvidia_driver() {
+        let pkgs = resolve_gaming_packages(&inv(vec![nvidia(NvidiaGeneration::Ada, 0x2684)]));
+        // Phase 15: NVIDIA VA-API via libva-nvidia-driver.
+        assert!(pkgs.contains(&"libva-nvidia-driver".to_string()));
     }
 
     #[test]
@@ -441,6 +576,69 @@ Include = /etc/pacman.d/mirrorlist
         let path = dir.path().join("pacman.conf");
         std::fs::write(&path, SAMPLE_ENABLED).unwrap();
         assert!(is_multilib_enabled(&path));
+    }
+
+    // Phase 15: sanitation warnings ──────────────────────────────────────────────────────
+
+    use std::collections::HashSet;
+
+    fn installed_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sanitation_no_warnings_on_clean_amd() {
+        let w = sanitation_warnings_from_installed(&inv(vec![amd(0x73bf)]), &installed_set(&[]));
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn sanitation_flags_amdvlk_on_amd_host() {
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![amd(0x73bf)]),
+            &installed_set(&["amdvlk", "lib32-amdvlk"]),
+        );
+        assert_eq!(w.len(), 1);
+        assert!(w[0].title.contains("AMDVLK"));
+        assert!(w[0].remediation.contains("amdvlk"));
+    }
+
+    #[test]
+    fn sanitation_ignores_amdvlk_on_non_amd_host() {
+        // If someone has amdvlk installed but no AMD GPU, that's weird but not our concern.
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![intel(0x64a0)]),
+            &installed_set(&["amdvlk"]),
+        );
+        assert!(w.iter().all(|x| !x.title.contains("AMDVLK")));
+    }
+
+    #[test]
+    fn sanitation_flags_xf86_video_intel() {
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![intel(0x64a0)]),
+            &installed_set(&["xf86-video-intel"]),
+        );
+        assert!(w.iter().any(|x| x.title.contains("xf86-video-intel")));
+    }
+
+    #[test]
+    fn sanitation_flags_mesa_vdpau_regardless_of_gpu() {
+        // VDPAU is a cross-vendor legacy — flag it on any host that has it.
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![nvidia(NvidiaGeneration::Ada, 0x2684)]),
+            &installed_set(&["mesa-vdpau"]),
+        );
+        assert!(w.iter().any(|x| x.title.contains("VDPAU")));
+    }
+
+    #[test]
+    fn sanitation_clean_system_no_warnings() {
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![nvidia(NvidiaGeneration::Ada, 0x2684)]),
+            &installed_set(&["vulkan-radeon", "gamemode", "libva-nvidia-driver"]),
+        );
+        assert!(w.is_empty());
     }
 
     #[test]

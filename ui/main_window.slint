@@ -228,6 +228,14 @@ export component MainWindow inherits Window {
     in-out property <string> log-text: "";
     in-out property <bool> is-working: false;
 
+    // ── Phase 15/16 sanitation warnings (populated by gui::populate_detection) ─────────────
+    // Each entry is a single sentence describing a legacy / conflicting config detected on
+    // this host (AMDVLK alongside RADV, xf86-video-intel, mesa-vdpau, /etc/X11/xorg.conf
+    // cruft, WLR_NO_HARDWARE_CURSORS in user profile.d scripts, etc.). Rendered as amber
+    // bullets in a dedicated banner card directly below the Hardware card so users see
+    // them the moment the app opens.
+    in-out property <[string]> sanitation-warnings: [];
+
     // ── Callbacks into Rust ────────────────────────────────────────────────────────────────
     callback apply();
     callback detect();
@@ -325,6 +333,49 @@ export component MainWindow inherits Window {
                     }
                 }
 
+                // ── SANITATION WARNING card (Phase 15/16) ──────────────────────────────────
+                // Only visible when backend detected at least one legacy/conflicting config.
+                // Styled amber-on-dark so users can't miss it without blocking the UI.
+                if root.sanitation-warnings.length > 0 : Rectangle {
+                    background: #3C2A1A;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: #8A5A20;
+
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "⚠";
+                                color: #FFC66E;
+                                font-size: 18px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Legacy configuration detected";
+                                color: #FFC66E;
+                                font-size: 14px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Text {
+                            text: "These settings follow outdated tutorials and may degrade performance or break modern Wayland. Review and remediate before applying new tweaks.";
+                            color: #E8D4B0;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        for warn[i] in root.sanitation-warnings : Text {
+                            text: "•  " + warn;
+                            color: #F5DFB8;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
                 // ── TWEAKS card ────────────────────────────────────────────────────────────
                 Card {
                     Text {
@@ -336,7 +387,7 @@ export component MainWindow inherits Window {
 
                     TweakRow {
                         title: "Wayland environment + initramfs modules";
-                        subtitle: "Sets GBM_BACKEND / LIBVA_DRIVER_NAME / __GLX_VENDOR_LIBRARY_NAME and adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to the initramfs for early KMS. Hybrid hosts also get a PRIME outputclass Xorg drop-in.";
+                        subtitle: "Writes the modern comment-only /etc/profile.d drop-in (no more legacy GBM_BACKEND global export — breaks hybrid PRIME), adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to initramfs for early KMS, and drops a PRIME Xorg outputclass on hybrid hosts.";
                         checked <=> root.opt-wayland;
                         enabled: !root.is-working;
                         applied: root.state-wayland-applied;
@@ -346,8 +397,8 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #333333; }
 
                     TweakRow {
-                        title: "Kernel command line (nvidia-drm.modeset=1)";
-                        subtitle: "Required for NVIDIA on Wayland. Writes to the active bootloader's cmdline source (GRUB / systemd-boot / Limine / UKI) and runs the appropriate regeneration command.";
+                        title: "Kernel command line (GPU-aware)";
+                        subtitle: "NVIDIA: nvidia-drm.modeset=1 + fbdev=1 (native Wayland + hi-res TTY).  AMD amdgpu: amdgpu.ppfeaturemask=0xffffffff (unlocks CoreCtrl).  Intel i915: i915.enable_guc=3 (GuC + HuC firmware).  Intel xe: no params needed — the xe driver handles GuC natively. Writes to the detected bootloader (GRUB/systemd-boot/Limine/UKI) and runs its regeneration command.";
                         checked <=> root.opt-bootloader;
                         enabled: !root.is-working;
                         applied: root.state-bootloader-applied;

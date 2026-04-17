@@ -111,6 +111,29 @@ impl GpuInfo {
         }
     }
 
+    // Phase 15: kernel-driver classification. The `kernel_driver` field is populated by
+    // `read_driver_name` via `/sys/bus/pci/devices/<addr>/driver` — more reliable than
+    // parsing `lspci -k` because we read a structured symlink.
+
+    /// Intel GPU using the modern Xe kernel driver (Lunar Lake / Battlemage / Xe2+).
+    pub fn uses_xe_driver(&self) -> bool {
+        self.vendor == GpuVendor::Intel && self.kernel_driver.as_deref() == Some("xe")
+    }
+    /// Intel GPU using the classic i915 kernel driver (Gen2 … Gen12 / Alder Lake-era).
+    pub fn uses_i915_driver(&self) -> bool {
+        self.vendor == GpuVendor::Intel && self.kernel_driver.as_deref() == Some("i915")
+    }
+    /// AMD GPU using the modern amdgpu kernel driver (GCN 1.2+ / Southern Islands onward).
+    pub fn uses_amdgpu_driver(&self) -> bool {
+        self.vendor == GpuVendor::Amd && self.kernel_driver.as_deref() == Some("amdgpu")
+    }
+    /// AMD GPU using the legacy `radeon` driver (pre-GCN Terascale, or user-pinned).
+    /// Modern Arch ships amdgpu.si=1/cik=1 so even some older cards default to amdgpu;
+    /// seeing `radeon` in 2026 typically means a very old card or an explicit pin.
+    pub fn uses_radeon_legacy_driver(&self) -> bool {
+        self.vendor == GpuVendor::Amd && self.kernel_driver.as_deref() == Some("radeon")
+    }
+
     pub fn recommended_nvidia_package(&self) -> Option<NvidiaDriverRecommendation> {
         if self.vendor != GpuVendor::Nvidia {
             return None;
@@ -203,6 +226,20 @@ impl GpuInventory {
 
     pub fn has_amd(&self) -> bool {
         self.gpus.iter().any(|g| g.vendor == GpuVendor::Amd)
+    }
+
+    // Phase 15: driver-family convenience methods, for bootloader param selection.
+    pub fn has_intel_xe(&self) -> bool {
+        self.gpus.iter().any(|g| g.uses_xe_driver())
+    }
+    pub fn has_intel_i915(&self) -> bool {
+        self.gpus.iter().any(|g| g.uses_i915_driver())
+    }
+    pub fn has_amd_amdgpu(&self) -> bool {
+        self.gpus.iter().any(|g| g.uses_amdgpu_driver())
+    }
+    pub fn has_amd_radeon_legacy(&self) -> bool {
+        self.gpus.iter().any(|g| g.uses_radeon_legacy_driver())
     }
 
     pub fn nvidia_gpus(&self) -> impl Iterator<Item = &GpuInfo> {

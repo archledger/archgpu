@@ -91,6 +91,22 @@ pub fn scan(ctx: &Context, gpus: &GpuInventory, _form: FormFactor) -> Vec<Findin
         ));
     }
 
+    // Phase 15: informational / advisory findings for the detected driver family.
+    if gpus.has_intel_xe() {
+        findings.push(Finding::info(
+            "Intel GPU on modern `xe` kernel driver",
+            "The xe driver handles GuC/HuC firmware natively — no `i915.enable_guc=3` needed.",
+        ));
+    }
+    if gpus.has_amd_radeon_legacy() {
+        findings.push(Finding::warn(
+            "AMD GPU on legacy `radeon` kernel driver",
+            "Modern Arch kernels prefer the `amdgpu` driver for GCN 1.2+ hardware. The `radeon` \
+             driver is correct for pre-GCN Terascale cards only.",
+            "If you have a GCN 1.2+ GPU, check that amdgpu isn't disabled via a modprobe blacklist.",
+        ));
+    }
+
     let nvidia_present = gpus.has_nvidia();
 
     if !nvidia_present {
@@ -118,6 +134,15 @@ pub fn scan(ctx: &Context, gpus: &GpuInventory, _form: FormFactor) -> Vec<Findin
     check_vm_max_map_count(&mut findings);
     check_bumblebee_leftover(&mut findings);
     check_aur_helper(gpus, &mut findings);
+
+    // Phase 15 + Phase 16 sanitation — surface through the diagnostics scanner so that
+    // `--diagnose` CLI users see the same warnings the GUI banner shows.
+    for w in crate::core::gaming::sanitation_warnings(gpus) {
+        findings.push(Finding::warn(w.title, w.detail, w.remediation));
+    }
+    for w in crate::core::wayland::sanitation_warnings(ctx) {
+        findings.push(Finding::warn(w.title(), w.detail(), w.remediation()));
+    }
 
     findings
 }

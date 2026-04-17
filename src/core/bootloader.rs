@@ -8,7 +8,53 @@ use crate::core::Context;
 use crate::utils::fs_helper::{atomic_write, backup_to_dir, ChangeReport};
 use crate::utils::process::run_streaming;
 
+// Phase 11 + Phase 15/16 kernel cmdline parameters.
+//
+// Each param maps to a specific driver/vendor situation:
+//
+//   NVIDIA:
+//     nvidia-drm.modeset=1   → KMS modesetting, required for Wayland + early KMS
+//     nvidia-drm.fbdev=1     → enables DRM fbdev emulation (hi-res TTY, cleaner
+//                              boot handoff). Recommended from driver 545+.
+//
+//   AMD (amdgpu only):
+//     amdgpu.ppfeaturemask=0xffffffff
+//       Unlocks all PowerPlay features. Required for CoreCtrl, undervolt/OC
+//       tools, and full fan-curve control. Safe on stable kernels.
+//
+//   Intel (i915 only — NOT xe):
+//     i915.enable_guc=3      → enables both GuC submission and HuC firmware.
+//                              Default on most supported platforms from kernel
+//                              5.15+, but explicitly setting it ensures HuC is
+//                              loaded on older kernels / mixed-kernel systems.
+//
+//   Intel (xe):
+//     (none) — the xe driver manages GuC/HuC natively from boot.
+
 pub const NVIDIA_DRM_PARAM: &str = "nvidia-drm.modeset=1";
+pub const NVIDIA_DRM_FBDEV_PARAM: &str = "nvidia-drm.fbdev=1";
+pub const AMD_PPFEATUREMASK_PARAM: &str = "amdgpu.ppfeaturemask=0xffffffff";
+pub const I915_ENABLE_GUC_PARAM: &str = "i915.enable_guc=3";
+
+/// Enumerate the kernel command-line parameters this host should carry, based on its
+/// GPU inventory and each GPU's kernel driver. Returns an empty Vec for hosts whose
+/// only GPU(s) don't benefit from any cmdline tweak (e.g. Intel-xe only).
+///
+/// This is the SINGLE source of truth consumed by `apply()` and `check_state()`.
+pub fn required_kernel_params(gpus: &GpuInventory) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if gpus.has_nvidia() {
+        out.push(NVIDIA_DRM_PARAM);
+        out.push(NVIDIA_DRM_FBDEV_PARAM);
+    }
+    if gpus.has_amd_amdgpu() {
+        out.push(AMD_PPFEATUREMASK_PARAM);
+    }
+    if gpus.has_intel_i915() {
+        out.push(I915_ENABLE_GUC_PARAM);
+    }
+    out
+}
 
 // ── Bootloader classification ───────────────────────────────────────────────────────────────
 
@@ -66,17 +112,25 @@ pub fn detect_active_bootloader(ctx: &Context) -> BootloaderType {
 // ── Read-only state probe (used by diagnostics, auto::recommend, and the GUI) ──────────────
 
 pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
-    if !gpus.has_nvidia() {
+    let params = required_kernel_params(gpus);
+    if params.is_empty() {
+        // No applicable GPU (Intel-xe-only, or no GPU at all) → this tweak
+        // doesn't apply to this host. UI shows an "Unsupported" badge.
         return TweakState::Incompatible;
     }
-    let applied = match detect_active_bootloader(ctx) {
-        BootloaderType::Grub => grub_has_param(ctx, NVIDIA_DRM_PARAM),
-        BootloaderType::SystemdBoot => sdb_all_entries_have_param(ctx, NVIDIA_DRM_PARAM),
-        BootloaderType::Limine => limine_all_cmdlines_have_param(ctx, NVIDIA_DRM_PARAM),
-        BootloaderType::Uki => uki_has_param(ctx, NVIDIA_DRM_PARAM),
-        BootloaderType::Unknown => return TweakState::Incompatible,
-    };
-    if applied {
+    let bt = detect_active_bootloader(ctx);
+    if matches!(bt, BootloaderType::Unknown) {
+        return TweakState::Incompatible;
+    }
+    // Applied iff EVERY required param is present on the active bootloader.
+    let all_present = params.iter().all(|p| match bt {
+        BootloaderType::Grub => grub_has_param(ctx, p),
+        BootloaderType::SystemdBoot => sdb_all_entries_have_param(ctx, p),
+        BootloaderType::Limine => limine_all_cmdlines_have_param(ctx, p),
+        BootloaderType::Uki => uki_has_param(ctx, p),
+        BootloaderType::Unknown => false,
+    });
+    if all_present {
         TweakState::Applied
     } else {
         TweakState::Unapplied
@@ -177,37 +231,64 @@ pub fn detect<'a>(ctx: &'a Context) -> Result<Box<dyn BootManager + 'a>> {
 
 // ── Write APIs (apply) ──────────────────────────────────────────────────────────────────────
 
-pub fn apply(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeReport> {
+/// Apply every kernel cmdline parameter this host's GPU inventory requires to the active
+/// bootloader's cmdline source. Multi-param in a single edit — `[modeset=1, fbdev=1]` for
+/// NVIDIA, `[ppfeaturemask=...]` for amdgpu, `[enable_guc=3]` for i915, etc.
+pub fn apply(
+    ctx: &Context,
+    gpus: &GpuInventory,
+    progress: &mut dyn FnMut(&str),
+) -> Result<ChangeReport> {
+    let params = required_kernel_params(gpus);
+    if params.is_empty() {
+        return Ok(ChangeReport::AlreadyApplied {
+            detail: "no cmdline params needed for this host's GPU inventory".to_string(),
+        });
+    }
     match detect_active_bootloader(ctx) {
-        BootloaderType::Grub => apply_grub(ctx, progress),
-        BootloaderType::SystemdBoot => apply_sdb(ctx, progress),
-        BootloaderType::Limine => apply_limine(ctx, progress),
-        BootloaderType::Uki => apply_uki(ctx, progress),
+        BootloaderType::Grub => apply_grub(ctx, &params, progress),
+        BootloaderType::SystemdBoot => apply_sdb(ctx, &params, progress),
+        BootloaderType::Limine => apply_limine(ctx, &params, progress),
+        BootloaderType::Uki => apply_uki(ctx, &params, progress),
         BootloaderType::Unknown => anyhow::bail!("No supported bootloader detected."),
     }
 }
 
-fn apply_uki(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeReport> {
+fn apply_uki(
+    ctx: &Context,
+    params: &[&str],
+    progress: &mut dyn FnMut(&str),
+) -> Result<ChangeReport> {
     let path = &ctx.paths.kernel_cmdline;
     let original =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
-    if cmdline_contains(&original, NVIDIA_DRM_PARAM) {
+    let missing: Vec<&str> = params
+        .iter()
+        .copied()
+        .filter(|p| !cmdline_contains(&original, p))
+        .collect();
+    if missing.is_empty() {
         return Ok(ChangeReport::AlreadyApplied {
-            detail: format!("{}: {NVIDIA_DRM_PARAM} already present", path.display()),
+            detail: format!(
+                "{}: all params already present ({})",
+                path.display(),
+                params.join(" ")
+            ),
         });
     }
     let trimmed = original.trim_end();
     let new = if trimmed.is_empty() {
-        format!("{NVIDIA_DRM_PARAM}\n")
+        format!("{}\n", missing.join(" "))
     } else {
-        format!("{trimmed} {NVIDIA_DRM_PARAM}\n")
+        format!("{trimmed} {}\n", missing.join(" "))
     };
 
     if ctx.mode.is_dry_run() {
         return Ok(ChangeReport::Planned {
             detail: format!(
-                "UKI: add {NVIDIA_DRM_PARAM} to {} + run mkinitcpio -P",
+                "UKI: add {} to {} + run mkinitcpio -P",
+                missing.join(" "),
                 path.display()
             ),
         });
@@ -223,41 +304,61 @@ fn apply_uki(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRepo
         anyhow::bail!("mkinitcpio -P exited with {status}");
     }
     Ok(ChangeReport::Applied {
-        detail: format!("UKI: added {NVIDIA_DRM_PARAM} + rebuilt UKIs"),
+        detail: format!("UKI: added {} + rebuilt UKIs", missing.join(" ")),
         backup,
     })
 }
 
-fn apply_grub(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeReport> {
+fn apply_grub(
+    ctx: &Context,
+    params: &[&str],
+    progress: &mut dyn FnMut(&str),
+) -> Result<ChangeReport> {
     let path = &ctx.paths.grub_default;
     let original =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
-    let (new, changed, found) = grub_add_param(&original, NVIDIA_DRM_PARAM);
-    if !found {
+    // Iterate param-by-param through the pure helper so each addition is re-evaluated
+    // against the latest text (idempotent if a param was added earlier in the loop).
+    let mut current = original.clone();
+    let mut any_changed = false;
+    let mut any_found = false;
+    let mut added: Vec<&str> = Vec::new();
+    for p in params {
+        let (new, changed, found) = grub_add_param(&current, p);
+        current = new;
+        if changed {
+            any_changed = true;
+            added.push(p);
+        }
+        any_found = any_found || found;
+    }
+    if !any_found {
         anyhow::bail!(
             "GRUB_CMDLINE_LINUX_DEFAULT line not found in {}. Add it manually or re-generate /etc/default/grub.",
             path.display()
         );
     }
-    if !changed {
+    if !any_changed {
         return Ok(ChangeReport::AlreadyApplied {
             detail: format!(
-                "{}: GRUB_CMDLINE_LINUX_DEFAULT already contains {NVIDIA_DRM_PARAM}",
-                path.display()
+                "{}: GRUB_CMDLINE_LINUX_DEFAULT already contains {}",
+                path.display(),
+                params.join(" ")
             ),
         });
     }
     if ctx.mode.is_dry_run() {
         return Ok(ChangeReport::Planned {
             detail: format!(
-                "GRUB: add {NVIDIA_DRM_PARAM} to GRUB_CMDLINE_LINUX_DEFAULT + run grub-mkconfig -o {}",
+                "GRUB: add {} to GRUB_CMDLINE_LINUX_DEFAULT + run grub-mkconfig -o {}",
+                added.join(" "),
                 ctx.paths.grub_cfg.display()
             ),
         });
     }
     let backup = backup_to_dir(path, &ctx.paths.backup_dir)?;
-    atomic_write(path, &new)?;
+    atomic_write(path, &current)?;
 
     progress(&format!(
         "[grub-mkconfig] grub-mkconfig -o {}",
@@ -271,14 +372,19 @@ fn apply_grub(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRep
     }
     Ok(ChangeReport::Applied {
         detail: format!(
-            "GRUB: added {NVIDIA_DRM_PARAM} + regenerated {}",
+            "GRUB: added {} + regenerated {}",
+            added.join(" "),
             ctx.paths.grub_cfg.display()
         ),
         backup,
     })
 }
 
-fn apply_sdb(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeReport> {
+fn apply_sdb(
+    ctx: &Context,
+    params: &[&str],
+    progress: &mut dyn FnMut(&str),
+) -> Result<ChangeReport> {
     let entries_dir = &ctx.paths.sdb_entries;
     let rd = std::fs::read_dir(entries_dir)
         .with_context(|| format!("opening {}", entries_dir.display()))?;
@@ -295,12 +401,20 @@ fn apply_sdb(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRepo
         }
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let (new, changed, has_options) = sdb_add_param(&body, NVIDIA_DRM_PARAM);
-        if !has_options {
+        let mut current = body.clone();
+        let mut changed_any = false;
+        let mut has_options_any = false;
+        for p in params {
+            let (new, changed, has_options) = sdb_add_param(&current, p);
+            current = new;
+            changed_any = changed_any || changed;
+            has_options_any = has_options_any || has_options;
+        }
+        if !has_options_any {
             continue;
         }
         total += 1;
-        if !changed {
+        if !changed_any {
             already += 1;
             continue;
         }
@@ -310,7 +424,7 @@ fn apply_sdb(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRepo
             if first_backup.is_none() {
                 first_backup = bk;
             }
-            atomic_write(&path, &new)?;
+            atomic_write(&path, &current)?;
         }
     }
 
@@ -323,14 +437,16 @@ fn apply_sdb(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRepo
     if modified == 0 {
         return Ok(ChangeReport::AlreadyApplied {
             detail: format!(
-                "systemd-boot: all {already} loader entries already contain {NVIDIA_DRM_PARAM}"
+                "systemd-boot: all {already} loader entries already contain {}",
+                params.join(" ")
             ),
         });
     }
     if ctx.mode.is_dry_run() {
         return Ok(ChangeReport::Planned {
             detail: format!(
-                "systemd-boot: add {NVIDIA_DRM_PARAM} to {modified} entr{} + run bootctl update",
+                "systemd-boot: add {} to {modified} entr{} + run bootctl update",
+                params.join(" "),
                 if modified == 1 { "y" } else { "ies" }
             ),
         });
@@ -341,20 +457,24 @@ fn apply_sdb(ctx: &Context, progress: &mut dyn FnMut(&str)) -> Result<ChangeRepo
     cmd.arg("update");
     let status = run_streaming(cmd, |line| progress(&format!("[bootctl] {line}")))?;
     if !status.success() {
-        // bootctl update failure is non-fatal — the config is already written.
         log::warn!("bootctl update exited with {status} (non-fatal)");
     }
 
     Ok(ChangeReport::Applied {
         detail: format!(
-            "systemd-boot: added {NVIDIA_DRM_PARAM} to {modified} loader entr{} and ran bootctl update",
+            "systemd-boot: added {} to {modified} loader entr{} and ran bootctl update",
+            params.join(" "),
             if modified == 1 { "y" } else { "ies" }
         ),
         backup: first_backup,
     })
 }
 
-fn apply_limine(ctx: &Context, _progress: &mut dyn FnMut(&str)) -> Result<ChangeReport> {
+fn apply_limine(
+    ctx: &Context,
+    params: &[&str],
+    _progress: &mut dyn FnMut(&str),
+) -> Result<ChangeReport> {
     let mut any_found = false;
     let mut any_modified = false;
     let mut first_backup: Option<PathBuf> = None;
@@ -366,19 +486,27 @@ fn apply_limine(ctx: &Context, _progress: &mut dyn FnMut(&str)) -> Result<Change
         }
         let original = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let (new, changed, found) = limine_add_param(&original, NVIDIA_DRM_PARAM);
-        if !found {
+        let mut current = original.clone();
+        let mut changed_any = false;
+        let mut found_any = false;
+        for p in params {
+            let (new, changed, found) = limine_add_param(&current, p);
+            current = new;
+            changed_any = changed_any || changed;
+            found_any = found_any || found;
+        }
+        if !found_any {
             continue;
         }
         any_found = true;
-        if changed {
+        if changed_any {
             any_modified = true;
             if !ctx.mode.is_dry_run() {
                 let bk = backup_to_dir(&path, &ctx.paths.backup_dir)?;
                 if first_backup.is_none() {
                     first_backup = bk;
                 }
-                atomic_write(&path, &new)?;
+                atomic_write(&path, &current)?;
             }
             touched.push(path);
         }
@@ -391,20 +519,25 @@ fn apply_limine(ctx: &Context, _progress: &mut dyn FnMut(&str)) -> Result<Change
     }
     if !any_modified {
         return Ok(ChangeReport::AlreadyApplied {
-            detail: format!("Limine: {NVIDIA_DRM_PARAM} already present in all cmdline directives"),
+            detail: format!(
+                "Limine: {} already present in all cmdline directives",
+                params.join(" ")
+            ),
         });
     }
     if ctx.mode.is_dry_run() {
         return Ok(ChangeReport::Planned {
             detail: format!(
-                "Limine: add {NVIDIA_DRM_PARAM} to {} file(s). No command to run — Limine reads its config at boot.",
+                "Limine: add {} to {} file(s). No regeneration needed — Limine reads its config at boot.",
+                params.join(" "),
                 touched.len()
             ),
         });
     }
     Ok(ChangeReport::Applied {
         detail: format!(
-            "Limine: added {NVIDIA_DRM_PARAM} to {} file(s). No regeneration needed — Limine reads its config at boot.",
+            "Limine: added {} to {} file(s). No regeneration needed — Limine reads its config at boot.",
+            params.join(" "),
             touched.len()
         ),
         backup: first_backup,
@@ -927,8 +1060,12 @@ MODULE_PATH=boot():/initramfs-linux.img
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(&ctx.paths.kernel_cmdline, "rw quiet\n");
-        // DryRun doesn't write but reports Planned
-        let r = apply_uki(&ctx, &mut |_| {}).unwrap();
+        let r = apply_uki(
+            &ctx,
+            &[NVIDIA_DRM_PARAM, NVIDIA_DRM_FBDEV_PARAM],
+            &mut |_| {},
+        )
+        .unwrap();
         assert!(matches!(r, ChangeReport::Planned { .. }));
         // File unchanged after dry-run
         let body = std::fs::read_to_string(&ctx.paths.kernel_cmdline).unwrap();
@@ -1002,64 +1139,208 @@ MODULE_PATH=boot():/initramfs-linux.img
     }
 
     #[test]
-    fn check_state_applied_for_uki_with_param() {
+    fn check_state_applied_for_uki_with_both_params() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
-        write(&ctx.paths.kernel_cmdline, "rw quiet nvidia-drm.modeset=1\n");
-        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
-    }
-
-    #[test]
-    fn check_state_applied_for_grub_with_param() {
-        let dir = tempdir().unwrap();
-        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        // Phase 16: NVIDIA hosts need BOTH modeset=1 AND fbdev=1 for Applied.
         write(
-            &ctx.paths.grub_default,
-            "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet nvidia-drm.modeset=1\"\n",
+            &ctx.paths.kernel_cmdline,
+            "rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
         );
         assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
     }
 
     #[test]
-    fn check_state_applied_for_sdb_when_all_entries_have_param() {
+    fn check_state_unapplied_for_uki_when_only_modeset_present() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        // fbdev=1 missing → Unapplied even though modeset=1 is there.
+        write(&ctx.paths.kernel_cmdline, "rw quiet nvidia-drm.modeset=1\n");
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Unapplied);
+    }
+
+    #[test]
+    fn check_state_applied_for_grub_with_both_params() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.grub_default,
+            "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\"\n",
+        );
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+    }
+
+    #[test]
+    fn check_state_applied_for_sdb_when_all_entries_have_both_params() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(&ctx.paths.sdb_loader_conf, "timeout 3\n");
-        let entry = "title Arch\nlinux /vmlinuz\ninitrd /init.img\noptions root=UUID=1 rw nvidia-drm.modeset=1\n";
+        let entry = "title Arch\nlinux /vmlinuz\ninitrd /init.img\noptions root=UUID=1 rw nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n";
         std::fs::create_dir_all(&ctx.paths.sdb_entries).unwrap();
         std::fs::write(ctx.paths.sdb_entries.join("arch.conf"), entry).unwrap();
-        // Remove UKI cmdline so SDB is detected
         assert_eq!(detect_active_bootloader(&ctx), BootloaderType::SystemdBoot);
         assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
     }
 
     #[test]
-    fn check_state_unapplied_for_sdb_when_one_entry_missing() {
+    fn check_state_unapplied_for_sdb_when_one_entry_missing_fbdev() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(&ctx.paths.sdb_loader_conf, "timeout 3\n");
         std::fs::create_dir_all(&ctx.paths.sdb_entries).unwrap();
         std::fs::write(
             ctx.paths.sdb_entries.join("arch.conf"),
-            "options root=UUID=1 rw nvidia-drm.modeset=1\n",
+            "options root=UUID=1 rw nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
         )
         .unwrap();
         std::fs::write(
             ctx.paths.sdb_entries.join("fallback.conf"),
-            "options root=UUID=1 rw\n",
+            "options root=UUID=1 rw nvidia-drm.modeset=1\n", // fbdev missing here
         )
         .unwrap();
         assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Unapplied);
     }
 
     #[test]
-    fn check_state_applied_for_limine() {
+    fn check_state_applied_for_limine_with_both_params() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(
             &ctx.paths.limine_candidates[0],
-            "/Arch\n    cmdline: rw quiet nvidia-drm.modeset=1\n",
+            "/Arch\n    cmdline: rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
         );
         assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+    }
+
+    // Phase 15: per-vendor required_kernel_params matrix ───────────────────────────────────
+
+    fn intel_xe_inv() -> GpuInventory {
+        use crate::core::gpu::{GpuInfo, GpuVendor};
+        GpuInventory {
+            gpus: vec![GpuInfo {
+                vendor: GpuVendor::Intel,
+                vendor_id: 0x8086,
+                device_id: 0x64a0,
+                pci_address: "0000:00:02.0".into(),
+                vendor_name: "Intel".into(),
+                product_name: "Lunar Lake Arc 140V".into(),
+                kernel_driver: Some("xe".into()),
+                is_integrated: true,
+                nvidia_gen: None,
+            }],
+        }
+    }
+
+    fn intel_i915_inv() -> GpuInventory {
+        use crate::core::gpu::{GpuInfo, GpuVendor};
+        GpuInventory {
+            gpus: vec![GpuInfo {
+                vendor: GpuVendor::Intel,
+                vendor_id: 0x8086,
+                device_id: 0x3e9b,
+                pci_address: "0000:00:02.0".into(),
+                vendor_name: "Intel".into(),
+                product_name: "UHD 630 (Coffee Lake)".into(),
+                kernel_driver: Some("i915".into()),
+                is_integrated: true,
+                nvidia_gen: None,
+            }],
+        }
+    }
+
+    fn amd_amdgpu_inv() -> GpuInventory {
+        use crate::core::gpu::{GpuInfo, GpuVendor};
+        GpuInventory {
+            gpus: vec![GpuInfo {
+                vendor: GpuVendor::Amd,
+                vendor_id: 0x1002,
+                device_id: 0x73bf,
+                pci_address: "0000:03:00.0".into(),
+                vendor_name: "AMD".into(),
+                product_name: "RX 6800".into(),
+                kernel_driver: Some("amdgpu".into()),
+                is_integrated: false,
+                nvidia_gen: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn required_kernel_params_nvidia_only() {
+        let p = required_kernel_params(&nvidia_inv());
+        assert!(p.contains(&NVIDIA_DRM_PARAM));
+        assert!(p.contains(&NVIDIA_DRM_FBDEV_PARAM));
+        assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn required_kernel_params_intel_xe_is_empty() {
+        // Phase 15: xe driver handles GuC/HuC natively — no params needed.
+        assert!(required_kernel_params(&intel_xe_inv()).is_empty());
+    }
+
+    #[test]
+    fn required_kernel_params_intel_i915_gets_guc() {
+        let p = required_kernel_params(&intel_i915_inv());
+        assert_eq!(p, vec![I915_ENABLE_GUC_PARAM]);
+    }
+
+    #[test]
+    fn required_kernel_params_amdgpu_gets_ppfeaturemask() {
+        let p = required_kernel_params(&amd_amdgpu_inv());
+        assert_eq!(p, vec![AMD_PPFEATUREMASK_PARAM]);
+    }
+
+    #[test]
+    fn required_kernel_params_intel_xe_plus_nvidia_dgpu_only_nvidia() {
+        use crate::core::gpu::{GpuInfo, GpuVendor};
+        let inv = GpuInventory {
+            gpus: vec![
+                intel_xe_inv().gpus.into_iter().next().unwrap(),
+                GpuInfo {
+                    vendor: GpuVendor::Nvidia,
+                    vendor_id: 0x10de,
+                    device_id: 0x25a2,
+                    pci_address: "0000:01:00.0".into(),
+                    vendor_name: "NVIDIA".into(),
+                    product_name: "RTX 3050M".into(),
+                    kernel_driver: Some("nvidia".into()),
+                    is_integrated: false,
+                    nvidia_gen: None,
+                },
+            ],
+        };
+        let p = required_kernel_params(&inv);
+        assert!(p.contains(&NVIDIA_DRM_PARAM));
+        assert!(p.contains(&NVIDIA_DRM_FBDEV_PARAM));
+        assert!(!p.contains(&I915_ENABLE_GUC_PARAM));
+    }
+
+    #[test]
+    fn check_state_incompatible_for_intel_xe_only() {
+        // Phase 15: Intel-xe-only host has no bootloader params at all → Incompatible.
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(&ctx.paths.kernel_cmdline, "rw quiet\n");
+        assert_eq!(check_state(&ctx, &intel_xe_inv()), TweakState::Incompatible);
+    }
+
+    #[test]
+    fn check_state_applied_for_amdgpu_with_ppfeaturemask() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.kernel_cmdline,
+            "rw quiet amdgpu.ppfeaturemask=0xffffffff\n",
+        );
+        assert_eq!(check_state(&ctx, &amd_amdgpu_inv()), TweakState::Applied);
+    }
+
+    #[test]
+    fn check_state_applied_for_i915_with_enable_guc() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(&ctx.paths.kernel_cmdline, "rw quiet i915.enable_guc=3\n");
+        assert_eq!(check_state(&ctx, &intel_i915_inv()), TweakState::Applied);
     }
 }

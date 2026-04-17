@@ -1,5 +1,6 @@
 use anyhow::Result;
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use std::rc::Rc;
 use std::thread;
 
 use crate::core::auto;
@@ -239,6 +240,8 @@ fn populate_detection(ui: &MainWindow) {
 
     // Per-tweak state flags → drives the Switch disabled-state + [✓ Applied] / Unsupported badges.
     apply_tweak_states(ui, &ctx, &gpus);
+    // Phase 15/16 sanitation — populate the amber warning banner.
+    apply_sanitation_warnings(ui, &ctx, &gpus);
 
     // Pre-arm toggles from a real recommendation so startup ≡ Auto-Optimize.
     let recommended = auto::recommend(&ctx, form, &gpus);
@@ -263,6 +266,30 @@ fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
 
     let g = gaming::check_state(ctx, gpus);
     ui.set_state_gaming_applied(g.is_applied());
+}
+
+/// Phase 15/16: poll the gaming + wayland sanitation scanners and push each warning as a
+/// one-line summary into the GUI's `sanitation-warnings` list-model. The Slint side renders
+/// them as amber bullets in a dedicated banner above the Tweaks card when non-empty.
+fn apply_sanitation_warnings(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
+    let mut lines: Vec<SharedString> = Vec::new();
+    for w in gaming::sanitation_warnings(gpus) {
+        // Show the title + remediation hint in a single line. Full detail goes through the
+        // diagnostics scanner for users who want to dig in.
+        lines.push(SharedString::from(format!(
+            "{} — {}",
+            w.title, w.remediation
+        )));
+    }
+    for w in wayland::sanitation_warnings(ctx) {
+        lines.push(SharedString::from(format!(
+            "{} — {}",
+            w.title(),
+            w.remediation()
+        )));
+    }
+    let model: Rc<VecModel<SharedString>> = Rc::new(VecModel::from(lines));
+    ui.set_sanitation_warnings(ModelRc::from(model));
 }
 
 fn describe_bootloader_source(ctx: &Context, bt: BootloaderType) -> String {

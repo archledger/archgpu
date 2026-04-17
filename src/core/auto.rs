@@ -175,7 +175,11 @@ mod tests {
     fn nvidia_desktop_with_bootloader_already_applied_skips_bootloader() {
         let tmp = tempdir().unwrap();
         seed_pacman(tmp.path(), MULTILIB_ON);
-        seed_cmdline_uki(tmp.path(), "rw quiet nvidia-drm.modeset=1\n"); // already set
+        // Phase 16: "already applied" now means BOTH modeset=1 AND fbdev=1 are present.
+        seed_cmdline_uki(
+            tmp.path(),
+            "rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
+        );
         let ctx = Context::rooted_for_test(tmp.path(), ExecutionMode::DryRun);
         let rec = recommend(&ctx, FormFactor::Desktop, &nvidia_desktop());
         assert!(rec.wayland, "wayland drop-ins not yet present → recommend");

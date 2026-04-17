@@ -38,6 +38,7 @@ pub struct SystemPaths {
     pub modprobe_d: PathBuf,
     pub sysctl_d: PathBuf,
     pub xorg_d: PathBuf,
+    pub etc_x11_xorg_conf: PathBuf, // Phase 16: legacy-xorg.conf probe target
     pub kernel_cmdline: PathBuf,
     pub pacman_conf: PathBuf,
     pub dmi_chassis: PathBuf,
@@ -58,6 +59,7 @@ impl SystemPaths {
             modprobe_d: PathBuf::from("/etc/modprobe.d"),
             sysctl_d: PathBuf::from("/etc/sysctl.d"),
             xorg_d: PathBuf::from("/etc/X11/xorg.conf.d"),
+            etc_x11_xorg_conf: PathBuf::from("/etc/X11/xorg.conf"),
             kernel_cmdline: PathBuf::from("/etc/kernel/cmdline"),
             pacman_conf: PathBuf::from("/etc/pacman.conf"),
             dmi_chassis: PathBuf::from("/sys/class/dmi/id/chassis_type"),
@@ -84,6 +86,7 @@ impl SystemPaths {
             modprobe_d: root.join("etc/modprobe.d"),
             sysctl_d: root.join("etc/sysctl.d"),
             xorg_d: root.join("etc/X11/xorg.conf.d"),
+            etc_x11_xorg_conf: root.join("etc/X11/xorg.conf"),
             kernel_cmdline: root.join("etc/kernel/cmdline"),
             pacman_conf: root.join("etc/pacman.conf"),
             dmi_chassis: root.join("sys/class/dmi/id/chassis_type"),
@@ -177,14 +180,11 @@ pub fn run_actions(
         }
     }
     if actions.bootloader {
-        if has_nv {
-            out.push(("bootloader", bootloader::apply(ctx, progress)?));
-        } else {
-            out.push((
-                "bootloader",
-                skip_non_nvidia("nvidia-drm.modeset=1 cmdline"),
-            ));
-        }
+        // Phase 15/16: the bootloader action now covers multi-vendor kernel cmdline tweaks
+        // (NVIDIA modeset+fbdev, amdgpu.ppfeaturemask, i915.enable_guc). It applies to any
+        // host whose GPU inventory yields a non-empty `required_kernel_params` list —
+        // Intel-xe-only hosts cleanly report "no cmdline params needed".
+        out.push(("bootloader", bootloader::apply(ctx, gpus, progress)?));
     }
     if actions.power {
         if has_nv {
