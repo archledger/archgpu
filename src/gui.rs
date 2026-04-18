@@ -252,20 +252,29 @@ fn populate_detection(ui: &MainWindow) {
 }
 
 fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
+    // Phase 17: three exclusive per-tweak flags drive the Slint UI:
+    //   active         → green "✓ Active" badge (kernel confirms running)
+    //   pending_reboot → yellow "⟳ Reboot pending" badge (config done, kernel not yet)
+    //   incompatible   → orange "Unsupported" badge (not applicable to this host)
+    // When all three are false the Switch is rendered.
     let w = wayland::check_state(ctx, gpus);
-    ui.set_state_wayland_applied(w.is_applied());
+    ui.set_state_wayland_applied(w.is_active());
+    ui.set_state_wayland_pending_reboot(w.is_pending_reboot());
     ui.set_state_wayland_incompatible(w.is_incompatible());
 
     let b = bootloader::check_state(ctx, gpus);
-    ui.set_state_bootloader_applied(b.is_applied());
+    ui.set_state_bootloader_applied(b.is_active());
+    ui.set_state_bootloader_pending_reboot(b.is_pending_reboot());
     ui.set_state_bootloader_incompatible(b.is_incompatible());
 
     let p = power::check_state(ctx, gpus);
-    ui.set_state_power_applied(p.is_applied());
+    ui.set_state_power_applied(p.is_active());
+    ui.set_state_power_pending_reboot(p.is_pending_reboot());
     ui.set_state_power_incompatible(p.is_incompatible());
 
     let g = gaming::check_state(ctx, gpus);
-    ui.set_state_gaming_applied(g.is_applied());
+    ui.set_state_gaming_applied(g.is_active());
+    ui.set_state_gaming_pending_reboot(g.is_pending_reboot());
 }
 
 /// Phase 15/16: poll the gaming + wayland sanitation scanners and push each warning as a

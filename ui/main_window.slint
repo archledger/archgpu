@@ -133,8 +133,11 @@ component TweakRow inherits HorizontalLayout {
     in-out property <bool> checked;
     in property <bool> enabled: true;
 
-    // Phase 11 state flags
+    // Phase 11/17 state flags — exclusive, but nothing enforces that in Slint; `applied`
+    // wins rendering priority, then `pending_reboot`, then `incompatible`. Logic in
+    // gui.rs guarantees only one is true at a time.
     in property <bool> applied: false;
+    in property <bool> pending_reboot: false;
     in property <bool> incompatible: false;
 
     spacing: 16px;
@@ -156,9 +159,13 @@ component TweakRow inherits HorizontalLayout {
             text: root.incompatible
                 ? "Unsupported on this host."
                 : (root.applied
-                    ? "Already applied — leave toggled off unless you want to redo it."
-                    : root.subtitle);
-            color: root.incompatible ? #E8944B : #A0A0A0;
+                    ? "Running in the live kernel — nothing to do."
+                    : (root.pending_reboot
+                        ? "Config written. Reboot to make the running kernel adopt it."
+                        : root.subtitle));
+            color: root.incompatible
+                ? #E8944B
+                : (root.pending_reboot ? #E8C474 : #A0A0A0);
             font-size: 11px;
             wrap: word-wrap;
         }
@@ -168,20 +175,26 @@ component TweakRow inherits HorizontalLayout {
         alignment: center;
         spacing: 4px;
 
-        // Applied → green badge (switch disabled)
+        // Active → green badge (switch disabled)
         if root.applied : StateBadge {
-            text: "✓ Applied";
+            text: "✓ Active";
             fill: #2E5C3A;
             text-color: #C8F5D4;
         }
+        // PendingReboot → yellow badge (switch disabled); user needs to reboot to activate.
+        if !root.applied && root.pending_reboot : StateBadge {
+            text: "⟳ Reboot";
+            fill: #6A5020;
+            text-color: #F5DFB8;
+        }
         // Incompatible → orange badge (switch disabled)
-        if root.incompatible : StateBadge {
+        if !root.applied && !root.pending_reboot && root.incompatible : StateBadge {
             text: "Unsupported";
             fill: #5C412E;
             text-color: #F5D4BB;
         }
         // Normal → Switch
-        if !root.applied && !root.incompatible : Switch {
+        if !root.applied && !root.pending_reboot && !root.incompatible : Switch {
             checked <=> root.checked;
             enabled: root.enabled;
         }
@@ -206,14 +219,24 @@ export component MainWindow inherits Window {
     in-out property <bool> opt-dry-run: true;
     in-out property <bool> opt-assume-yes: true;
 
-    // ── Phase 11 per-tweak state flags (filled by gui::populate_detection) ─────────────────
+    // ── Phase 11/17 per-tweak state flags (filled by gui::populate_detection) ──────────────
+    //   *-applied         → green "✓ Active" badge (kernel confirms running)
+    //   *-pending-reboot  → yellow "⟳ Reboot pending" badge (config written; kernel hasn't
+    //                       adopted it yet — the user still needs to reboot so the new
+    //                       cmdline takes effect). Only the bootloader tweak produces this
+    //                       today; other tweaks just go Active.
+    //   *-incompatible    → orange "Unsupported" badge (doesn't apply to this host)
     in-out property <bool> state-wayland-applied: false;
+    in-out property <bool> state-wayland-pending-reboot: false;
     in-out property <bool> state-wayland-incompatible: false;
     in-out property <bool> state-bootloader-applied: false;
+    in-out property <bool> state-bootloader-pending-reboot: false;
     in-out property <bool> state-bootloader-incompatible: false;
     in-out property <bool> state-power-applied: false;
+    in-out property <bool> state-power-pending-reboot: false;
     in-out property <bool> state-power-incompatible: false;
     in-out property <bool> state-gaming-applied: false;
+    in-out property <bool> state-gaming-pending-reboot: false;
 
     // ── Detection text (read from Rust) ────────────────────────────────────────────────────
     in-out property <string> chassis-text: "Detecting...";
@@ -387,21 +410,23 @@ export component MainWindow inherits Window {
 
                     TweakRow {
                         title: "Wayland environment + initramfs modules";
-                        subtitle: "Writes the modern comment-only /etc/profile.d drop-in (no more legacy GBM_BACKEND global export — breaks hybrid PRIME), adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to initramfs for early KMS, and drops a PRIME Xorg outputclass on hybrid hosts.";
+                        subtitle: "Writes the modern comment-only /etc/profile.d drop-in (no more legacy GBM_BACKEND global export — breaks hybrid PRIME), adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to initramfs via MODULES+=() (never touches HOOKS — that would break simpledrm consoles), and drops a PRIME Xorg outputclass on hybrid hosts.";
                         checked <=> root.opt-wayland;
                         enabled: !root.is-working;
                         applied: root.state-wayland-applied;
+                        pending_reboot: root.state-wayland-pending-reboot;
                         incompatible: root.state-wayland-incompatible;
                     }
 
                     Rectangle { height: 1px; background: #333333; }
 
                     TweakRow {
-                        title: "Kernel command line (GPU-aware)";
-                        subtitle: "NVIDIA: nvidia-drm.modeset=1 + fbdev=1 (native Wayland + hi-res TTY).  AMD amdgpu: amdgpu.ppfeaturemask=0xffffffff (unlocks CoreCtrl).  Intel i915: i915.enable_guc=3 (GuC + HuC firmware).  Intel xe: no params needed — the xe driver handles GuC natively. Writes to the detected bootloader (GRUB/systemd-boot/Limine/UKI) and runs its regeneration command.";
+                        title: "Kernel command line (GPU-aware; live-verified)";
+                        subtitle: "NVIDIA: nvidia-drm.modeset=1 + fbdev=1 (native Wayland + hi-res TTY).  AMD amdgpu: amdgpu.ppfeaturemask=0xffffffff (unlocks CoreCtrl).  Intel i915: i915.enable_guc=3 (GuC + HuC).  Intel xe: no params — handled natively.  Writes to the detected bootloader (GRUB/systemd-boot/Limine/UKI) and regenerates.  Reports Active only when the running kernel confirms the param (via /sys/module/<m>/parameters/<p>) — otherwise Reboot pending.";
                         checked <=> root.opt-bootloader;
                         enabled: !root.is-working;
                         applied: root.state-bootloader-applied;
+                        pending_reboot: root.state-bootloader-pending-reboot;
                         incompatible: root.state-bootloader-incompatible;
                     }
 
@@ -415,6 +440,7 @@ export component MainWindow inherits Window {
                         checked <=> root.opt-power;
                         enabled: !root.is-working;
                         applied: root.state-power-applied;
+                        pending_reboot: root.state-power-pending-reboot;
                         incompatible: root.state-power-incompatible;
                     }
 
@@ -422,10 +448,11 @@ export component MainWindow inherits Window {
 
                     TweakRow {
                         title: "Gaming setup — multilib, Vulkan, gamemode, mangohud";
-                        subtitle: "Uncomments [multilib], installs per-vendor Vulkan (nvidia-utils / vulkan-intel / vulkan-radeon) + 32-bit variants + gamemode + mangohud, writes vm.max_map_count=1048576, and builds legacy NVIDIA drivers from AUR via yay (auto-bootstrapped) when needed.";
+                        subtitle: "Uncomments [multilib], installs per-vendor Vulkan (nvidia-utils / vulkan-intel / vulkan-radeon) + 32-bit variants + gamemode + mangohud + VA-API (libva-mesa-driver / intel-media-driver / libva-nvidia-driver), writes vm.max_map_count=1048576, and builds legacy NVIDIA drivers from AUR via yay (auto-bootstrapped) when needed.";
                         checked <=> root.opt-gaming;
                         enabled: !root.is-working;
                         applied: root.state-gaming-applied;
+                        pending_reboot: root.state-gaming-pending-reboot;
                         incompatible: false;
                     }
                 }

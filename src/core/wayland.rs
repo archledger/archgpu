@@ -35,8 +35,18 @@ const PROFILE_D_CONTENT: &str = "\
 # that invocation only.
 ";
 
-// `MODULES+=(...)` appends rather than overwrites (mkinitcpio sources drop-ins after the main
-// config; using `=` would clobber the user's existing MODULES line).
+// Phase 17 safety invariant (audit-verified):
+//
+//   1. We write to `/etc/mkinitcpio.conf.d/nvidia-modules.conf` — a DROP-IN file. We never
+//      read, parse, or modify `/etc/mkinitcpio.conf` directly. The master config remains
+//      exactly as the user (or pacman) left it; mkinitcpio merges our drop-in on top.
+//   2. The drop-in uses `MODULES+=(...)`, which APPENDS to whatever MODULES the user
+//      already set. Using `MODULES=(...)` in a drop-in would CLOBBER the user's list.
+//   3. We never touch the `HOOKS=(...)` array. In particular we do NOT add or remove the
+//      `kms` hook — removing it breaks modern simpledrm console handoff on systems using
+//      the generic `simpledrm` early-framebuffer, which is the default on most Arch hosts.
+//      Adding nvidia modules via MODULES is the correct path for early KMS without
+//      disturbing the hook chain.
 const MKINITCPIO_DROPIN_CONTENT: &str = "\
 # Managed by arch-nvidia-tweaker — do not edit by hand.
 MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)
@@ -59,7 +69,11 @@ pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
         return TweakState::Unapplied;
     };
     if current == PROFILE_D_CONTENT {
-        TweakState::Applied
+        // File-only tweak — mkinitcpio drop-ins take effect on the next initramfs rebuild
+        // (which `--apply-bootloader` triggers for UKI hosts via `mkinitcpio -P`). No
+        // sensible kernel-level probe distinguishes "pre-reboot" from "post-reboot" here,
+        // so return Active once the config matches.
+        TweakState::Active
     } else {
         // File exists but contains legacy content (likely from an older version of this
         // tool). The next --apply-wayland rewrites it to the modern comment-only form.

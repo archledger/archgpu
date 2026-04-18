@@ -40,7 +40,9 @@ pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
         return TweakState::Unapplied;
     };
     if expected.iter().all(|p| installed.contains(p.as_str())) {
-        TweakState::Applied
+        // Purely file/package-level; no kernel probe applies. "Active" == "packages are
+        // installed and multilib is on".
+        TweakState::Active
     } else {
         TweakState::Unapplied
     }

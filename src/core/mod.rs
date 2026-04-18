@@ -43,6 +43,11 @@ pub struct SystemPaths {
     pub pacman_conf: PathBuf,
     pub dmi_chassis: PathBuf,
     pub backup_dir: PathBuf,
+    // Phase 17: live-kernel-state probe. `sys_module` is the root of the /sys/module tree;
+    // specific params live under <sys_module>/<module>/parameters/<name>. A missing
+    // <sys_module>/<module>/ directory means the kernel module isn't loaded, which is the
+    // same signal as "module loaded but parameter reports wrong value" for our purposes.
+    pub sys_module: PathBuf,
     // Phase 11: multi-bootloader paths
     pub grub_default: PathBuf,
     pub grub_cfg: PathBuf,
@@ -64,6 +69,7 @@ impl SystemPaths {
             pacman_conf: PathBuf::from("/etc/pacman.conf"),
             dmi_chassis: PathBuf::from("/sys/class/dmi/id/chassis_type"),
             backup_dir: PathBuf::from("/var/backups/arch-nvidia-tweaker"),
+            sys_module: PathBuf::from("/sys/module"),
             grub_default: PathBuf::from("/etc/default/grub"),
             grub_cfg: PathBuf::from("/boot/grub/grub.cfg"),
             sdb_loader_conf: PathBuf::from("/boot/loader/loader.conf"),
@@ -91,6 +97,7 @@ impl SystemPaths {
             pacman_conf: root.join("etc/pacman.conf"),
             dmi_chassis: root.join("sys/class/dmi/id/chassis_type"),
             backup_dir: root.join("var/backups/arch-nvidia-tweaker"),
+            sys_module: root.join("sys/module"),
             grub_default: root.join("etc/default/grub"),
             grub_cfg: root.join("boot/grub/grub.cfg"),
             sdb_loader_conf: root.join("boot/loader/loader.conf"),

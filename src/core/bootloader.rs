@@ -122,18 +122,89 @@ pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
     if matches!(bt, BootloaderType::Unknown) {
         return TweakState::Incompatible;
     }
-    // Applied iff EVERY required param is present on the active bootloader.
-    let all_present = params.iter().all(|p| match bt {
+    // Stage 1 — file-level probe: does the cmdline source contain every required param?
+    let file_has_all = params.iter().all(|p| match bt {
         BootloaderType::Grub => grub_has_param(ctx, p),
         BootloaderType::SystemdBoot => sdb_all_entries_have_param(ctx, p),
         BootloaderType::Limine => limine_all_cmdlines_have_param(ctx, p),
         BootloaderType::Uki => uki_has_param(ctx, p),
         BootloaderType::Unknown => false,
     });
-    if all_present {
-        TweakState::Applied
+    if !file_has_all {
+        return TweakState::Unapplied;
+    }
+    // Stage 2 — Phase 17 LIVE VERIFICATION: prove the running kernel actually adopted
+    // the param. The cmdline source is the boot-time INPUT; the kernel's own sysfs
+    // export is the ground truth of what it's USING right now. If file-has-param but
+    // live-kernel-doesn't, a reboot is pending.
+    let live_ok = params.iter().all(|p| live_kernel_has_param(ctx, p));
+    if live_ok {
+        TweakState::Active
     } else {
-        TweakState::Unapplied
+        TweakState::PendingReboot
+    }
+}
+
+// ── Phase 17 live-kernel probes ─────────────────────────────────────────────────────────────
+
+/// Read a single kernel module parameter from sysfs — `/sys/module/<module>/parameters/<name>`.
+/// The path root is `ctx.paths.sys_module` so tests can seed a fake tree under a tempdir.
+fn read_sys_module_param(ctx: &Context, module: &str, name: &str) -> Option<String> {
+    let path = ctx
+        .paths
+        .sys_module
+        .join(module)
+        .join("parameters")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Return true if the running kernel reports the given cmdline param as active.
+///
+/// - `nvidia-drm.modeset=1`  → `/sys/module/nvidia_drm/parameters/modeset` reads "Y"
+/// - `nvidia-drm.fbdev=1`    → `/sys/module/nvidia_drm/parameters/fbdev` reads "Y"
+/// - `amdgpu.ppfeaturemask=0xffffffff` → `/sys/module/amdgpu/parameters/ppfeaturemask` reads
+///   "0xffffffff" or "-1" or "4294967295" (the kernel variously displays the same bit-pattern
+///   as signed/unsigned/hex depending on version)
+/// - `i915.enable_guc=3`     → `/sys/module/i915/parameters/enable_guc` reads "3" (or "-1" on
+///   newer kernels where that's shorthand for "auto, firmware loaded")
+///
+/// If the corresponding module isn't loaded (directory missing), returns false — that's the
+/// correct answer: live kernel is NOT using the param.
+fn live_kernel_has_param(ctx: &Context, param: &str) -> bool {
+    if param == NVIDIA_DRM_PARAM {
+        matches!(
+            read_sys_module_param(ctx, "nvidia_drm", "modeset").as_deref(),
+            Some("Y")
+        )
+    } else if param == NVIDIA_DRM_FBDEV_PARAM {
+        matches!(
+            read_sys_module_param(ctx, "nvidia_drm", "fbdev").as_deref(),
+            Some("Y")
+        )
+    } else if param == AMD_PPFEATUREMASK_PARAM {
+        matches!(
+            read_sys_module_param(ctx, "amdgpu", "ppfeaturemask").as_deref(),
+            Some("0xffffffff") | Some("-1") | Some("4294967295")
+        )
+    } else if param == I915_ENABLE_GUC_PARAM {
+        let v = read_sys_module_param(ctx, "i915", "enable_guc");
+        // Accept "3" (explicit GuC+HuC), "-1" (auto, firmware loaded on recent kernels),
+        // or any positive integer that equals 3 when parsed.
+        match v.as_deref() {
+            Some("3") | Some("-1") | Some("0x3") => true,
+            Some(s) => s
+                .trim_start_matches("0x")
+                .parse::<i32>()
+                .map(|n| n == 3 || n == -1)
+                .unwrap_or(false),
+            None => false,
+        }
+    } else {
+        // Unknown param — can't verify. Conservative answer: not live.
+        false
     }
 }
 
@@ -1138,16 +1209,55 @@ MODULE_PATH=boot():/initramfs-linux.img
         assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Unapplied);
     }
 
+    /// Phase 17 helper: seed `/sys/module/<mod>/parameters/<name>` under the temp-rooted ctx.
+    fn seed_sys_param(ctx: &Context, module: &str, name: &str, value: &str) {
+        let dir = ctx.paths.sys_module.join(module).join("parameters");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), value).unwrap();
+    }
+
+    /// Phase 17 helper: seed BOTH nvidia_drm params to live-active "Y".
+    fn seed_nvidia_drm_active(ctx: &Context) {
+        seed_sys_param(ctx, "nvidia_drm", "modeset", "Y\n");
+        seed_sys_param(ctx, "nvidia_drm", "fbdev", "Y\n");
+    }
+
     #[test]
-    fn check_state_applied_for_uki_with_both_params() {
+    fn check_state_active_for_uki_with_both_params_and_live_sysfs() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
-        // Phase 16: NVIDIA hosts need BOTH modeset=1 AND fbdev=1 for Applied.
         write(
             &ctx.paths.kernel_cmdline,
             "rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
         );
-        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+        seed_nvidia_drm_active(&ctx);
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Active);
+    }
+
+    #[test]
+    fn check_state_pending_reboot_when_file_ok_but_sysfs_reports_n() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.kernel_cmdline,
+            "rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
+        );
+        // Kernel module is loaded but reports N (didn't get the cmdline param — reboot pending).
+        seed_sys_param(&ctx, "nvidia_drm", "modeset", "N\n");
+        seed_sys_param(&ctx, "nvidia_drm", "fbdev", "N\n");
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::PendingReboot);
+    }
+
+    #[test]
+    fn check_state_pending_reboot_when_file_ok_but_module_not_loaded() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.kernel_cmdline,
+            "rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
+        );
+        // No sysfs entries at all → module not loaded → PendingReboot.
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::PendingReboot);
     }
 
     #[test]
@@ -1160,26 +1270,28 @@ MODULE_PATH=boot():/initramfs-linux.img
     }
 
     #[test]
-    fn check_state_applied_for_grub_with_both_params() {
+    fn check_state_active_for_grub_with_live_sysfs() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(
             &ctx.paths.grub_default,
             "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\"\n",
         );
-        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+        seed_nvidia_drm_active(&ctx);
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Active);
     }
 
     #[test]
-    fn check_state_applied_for_sdb_when_all_entries_have_both_params() {
+    fn check_state_active_for_sdb_with_live_sysfs() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(&ctx.paths.sdb_loader_conf, "timeout 3\n");
         let entry = "title Arch\nlinux /vmlinuz\ninitrd /init.img\noptions root=UUID=1 rw nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n";
         std::fs::create_dir_all(&ctx.paths.sdb_entries).unwrap();
         std::fs::write(ctx.paths.sdb_entries.join("arch.conf"), entry).unwrap();
+        seed_nvidia_drm_active(&ctx);
         assert_eq!(detect_active_bootloader(&ctx), BootloaderType::SystemdBoot);
-        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Active);
     }
 
     #[test]
@@ -1202,14 +1314,15 @@ MODULE_PATH=boot():/initramfs-linux.img
     }
 
     #[test]
-    fn check_state_applied_for_limine_with_both_params() {
+    fn check_state_active_for_limine_with_live_sysfs() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(
             &ctx.paths.limine_candidates[0],
             "/Arch\n    cmdline: rw quiet nvidia-drm.modeset=1 nvidia-drm.fbdev=1\n",
         );
-        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Applied);
+        seed_nvidia_drm_active(&ctx);
+        assert_eq!(check_state(&ctx, &nvidia_inv()), TweakState::Active);
     }
 
     // Phase 15: per-vendor required_kernel_params matrix ───────────────────────────────────
@@ -1326,21 +1439,74 @@ MODULE_PATH=boot():/initramfs-linux.img
     }
 
     #[test]
-    fn check_state_applied_for_amdgpu_with_ppfeaturemask() {
+    fn check_state_active_for_amdgpu_with_live_sysfs() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(
             &ctx.paths.kernel_cmdline,
             "rw quiet amdgpu.ppfeaturemask=0xffffffff\n",
         );
-        assert_eq!(check_state(&ctx, &amd_amdgpu_inv()), TweakState::Applied);
+        seed_sys_param(&ctx, "amdgpu", "ppfeaturemask", "0xffffffff\n");
+        assert_eq!(check_state(&ctx, &amd_amdgpu_inv()), TweakState::Active);
     }
 
     #[test]
-    fn check_state_applied_for_i915_with_enable_guc() {
+    fn check_state_active_for_amdgpu_accepts_negative_one_form() {
+        // Some kernels display the same bit-pattern as the signed int "-1".
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.kernel_cmdline,
+            "rw quiet amdgpu.ppfeaturemask=0xffffffff\n",
+        );
+        seed_sys_param(&ctx, "amdgpu", "ppfeaturemask", "-1\n");
+        assert_eq!(check_state(&ctx, &amd_amdgpu_inv()), TweakState::Active);
+    }
+
+    #[test]
+    fn check_state_pending_reboot_for_amdgpu_when_sysfs_is_default() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(
+            &ctx.paths.kernel_cmdline,
+            "rw quiet amdgpu.ppfeaturemask=0xffffffff\n",
+        );
+        // Default upstream amdgpu mask is 0xfffd7fff (some features masked out).
+        seed_sys_param(&ctx, "amdgpu", "ppfeaturemask", "0xfffd7fff\n");
+        assert_eq!(
+            check_state(&ctx, &amd_amdgpu_inv()),
+            TweakState::PendingReboot
+        );
+    }
+
+    #[test]
+    fn check_state_active_for_i915_with_live_enable_guc_3() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
         write(&ctx.paths.kernel_cmdline, "rw quiet i915.enable_guc=3\n");
-        assert_eq!(check_state(&ctx, &intel_i915_inv()), TweakState::Applied);
+        seed_sys_param(&ctx, "i915", "enable_guc", "3\n");
+        assert_eq!(check_state(&ctx, &intel_i915_inv()), TweakState::Active);
+    }
+
+    #[test]
+    fn check_state_active_for_i915_accepts_auto_minus_one() {
+        // Newer i915 kernels use `-1` to mean "auto; firmware loaded".
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(&ctx.paths.kernel_cmdline, "rw quiet i915.enable_guc=3\n");
+        seed_sys_param(&ctx, "i915", "enable_guc", "-1\n");
+        assert_eq!(check_state(&ctx, &intel_i915_inv()), TweakState::Active);
+    }
+
+    #[test]
+    fn check_state_pending_reboot_for_i915_when_guc_disabled() {
+        let dir = tempdir().unwrap();
+        let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
+        write(&ctx.paths.kernel_cmdline, "rw quiet i915.enable_guc=3\n");
+        seed_sys_param(&ctx, "i915", "enable_guc", "0\n");
+        assert_eq!(
+            check_state(&ctx, &intel_i915_inv()),
+            TweakState::PendingReboot
+        );
     }
 }

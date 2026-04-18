@@ -42,7 +42,11 @@ pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
         .unwrap_or(false);
     if enabled {
-        TweakState::Applied
+        // systemctl reports the unit enabled AND the modprobe drop-in is on disk. The
+        // option itself (NVreg_UseKernelSuspendNotifiers, NVreg_DynamicPowerManagement)
+        // is picked up on the next modprobe/boot; since we don't probe
+        // /sys/module/nvidia/parameters/<p> here, Active is the honest answer.
+        TweakState::Active
     } else {
         TweakState::Unapplied
     }
