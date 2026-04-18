@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::core::gpu::GpuInventory;
+use crate::core::hardware::FormFactor;
 use crate::core::state::TweakState;
 use crate::core::{prime, Context};
 use crate::utils::fs_helper::{write_dropin, ChangeReport};
@@ -196,7 +197,11 @@ pub fn sanitation_warnings(ctx: &Context) -> Vec<WaylandWarning> {
     out
 }
 
-pub fn apply(ctx: &Context, gpus: &GpuInventory) -> Result<Vec<ChangeReport>> {
+pub fn apply(
+    ctx: &Context,
+    gpus: &GpuInventory,
+    form: FormFactor,
+) -> Result<Vec<ChangeReport>> {
     let dry_run = ctx.mode.is_dry_run();
     let mut reports = Vec::with_capacity(3);
 
@@ -216,9 +221,11 @@ pub fn apply(ctx: &Context, gpus: &GpuInventory) -> Result<Vec<ChangeReport>> {
         dry_run,
     )?);
 
-    // For hybrid (Optimus / PRIME) setups, also drop a PRIME outputclass Xorg config when the
-    // default shipped by nvidia-utils isn't present. Pure Wayland sessions ignore the file.
-    reports.push(prime::apply(ctx, gpus)?);
+    // Phase 19: PRIME is a laptop concept. For desktop hybrids (NVIDIA + iGPU in a tower),
+    // the physical display cable dictates the primary GPU — writing a PRIME OutputClass
+    // there breaks the physical-cable assumption. `prime::apply` enforces the Laptop gate
+    // and returns AlreadyApplied with a clear skip reason on desktops.
+    reports.push(prime::apply(ctx, gpus, form)?);
 
     Ok(reports)
 }
@@ -254,7 +261,7 @@ mod tests {
     fn apply_writes_two_dropins_on_non_hybrid() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::Apply);
-        let reports = apply(&ctx, &single_nvidia()).unwrap();
+        let reports = apply(&ctx, &single_nvidia(), FormFactor::Desktop).unwrap();
         assert_eq!(reports.len(), 3);
         assert!(dir
             .path()
@@ -270,8 +277,8 @@ mod tests {
     fn apply_is_idempotent() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::Apply);
-        apply(&ctx, &empty_gpus()).unwrap();
-        let reports = apply(&ctx, &empty_gpus()).unwrap();
+        apply(&ctx, &empty_gpus(), FormFactor::Desktop).unwrap();
+        let reports = apply(&ctx, &empty_gpus(), FormFactor::Desktop).unwrap();
         for r in reports {
             assert!(matches!(r, ChangeReport::AlreadyApplied { .. }));
         }
@@ -281,7 +288,7 @@ mod tests {
     fn dry_run_writes_nothing() {
         let dir = tempdir().unwrap();
         let ctx = Context::rooted_for_test(dir.path(), ExecutionMode::DryRun);
-        apply(&ctx, &empty_gpus()).unwrap();
+        apply(&ctx, &empty_gpus(), FormFactor::Desktop).unwrap();
         assert!(!dir
             .path()
             .join("etc/profile.d/99-nvidia-wayland.sh")

@@ -176,7 +176,7 @@ pub fn run_actions(
 
     if actions.wayland {
         if has_nv {
-            for r in wayland::apply(ctx, gpus)? {
+            for r in wayland::apply(ctx, gpus, form)? {
                 out.push(("wayland", r));
             }
         } else {
@@ -206,7 +206,7 @@ pub fn run_actions(
         }
     }
     if actions.gaming {
-        for r in gaming::apply(ctx, gpus, assume_yes, progress)? {
+        for r in gaming::apply(ctx, gpus, form, assume_yes, progress)? {
             out.push(("gaming", r));
         }
     }

@@ -106,7 +106,7 @@ pub fn run(args: Cli) -> Result<()> {
     };
     let ctx = Context::production(mode);
 
-    let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or_else(|e| {
+    let form = hardware::get_chassis_type(&ctx.paths.dmi_chassis).unwrap_or_else(|e| {
         log::warn!("Chassis detection failed: {e:#}. Assuming Unknown form factor.");
         FormFactor::Unknown
     });

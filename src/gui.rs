@@ -41,7 +41,7 @@ pub fn run() -> Result<()> {
         ui.on_auto_optimize(move || {
             let Some(ui) = weak.upgrade() else { return };
             let ctx = Context::production(ExecutionMode::DryRun);
-            let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+            let form = hardware::get_chassis_type(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
             let gpus = GpuInventory::detect().unwrap_or_default();
 
             let rec = auto::recommend(&ctx, form, &gpus);
@@ -85,7 +85,7 @@ pub fn run() -> Result<()> {
             let thread_weak = ui.as_weak();
             thread::spawn(move || {
                 let ctx = Context::production(ExecutionMode::DryRun);
-                let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+                let form = hardware::get_chassis_type(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
                 let gpus = GpuInventory::detect().unwrap_or_default();
                 let findings = diagnostics::scan(&ctx, &gpus, form);
 
@@ -161,7 +161,7 @@ pub fn run() -> Result<()> {
             let thread_weak = ui.as_weak();
             thread::spawn(move || {
                 let ctx = Context::production(mode);
-                let form = hardware::detect(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
+                let form = hardware::get_chassis_type(&ctx.paths.dmi_chassis).unwrap_or(FormFactor::Unknown);
                 let gpus = GpuInventory::detect().unwrap_or_default();
 
                 let progress_weak = thread_weak.clone();
@@ -213,7 +213,7 @@ fn populate_detection(ui: &MainWindow) {
     let paths = SystemPaths::production();
     let ctx = Context::production(ExecutionMode::DryRun);
 
-    let (chassis_desc, is_laptop, form) = match hardware::detect(&paths.dmi_chassis) {
+    let (chassis_desc, is_laptop, form) = match hardware::get_chassis_type(&paths.dmi_chassis) {
         Ok(FormFactor::Laptop) => ("Laptop".to_string(), true, FormFactor::Laptop),
         Ok(FormFactor::Desktop) => ("Desktop".to_string(), false, FormFactor::Desktop),
         Ok(FormFactor::Unknown) => (
@@ -239,7 +239,7 @@ fn populate_detection(ui: &MainWindow) {
     ui.set_bootloader_text(SharedString::from(bootloader_desc));
 
     // Per-tweak state flags → drives the Switch disabled-state + [✓ Applied] / Unsupported badges.
-    apply_tweak_states(ui, &ctx, &gpus);
+    apply_tweak_states(ui, &ctx, &gpus, form);
     // Phase 15/16 sanitation — populate the amber warning banner.
     apply_sanitation_warnings(ui, &ctx, &gpus);
 
@@ -251,7 +251,7 @@ fn populate_detection(ui: &MainWindow) {
     ui.set_opt_gaming(recommended.gaming);
 }
 
-fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
+fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory, form: FormFactor) {
     // Phase 17: three exclusive per-tweak flags drive the Slint UI:
     //   active         → green "✓ Active" badge (kernel confirms running)
     //   pending_reboot → yellow "⟳ Reboot pending" badge (config done, kernel not yet)
@@ -272,7 +272,7 @@ fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory) {
     ui.set_state_power_pending_reboot(p.is_pending_reboot());
     ui.set_state_power_incompatible(p.is_incompatible());
 
-    let g = gaming::check_state(ctx, gpus);
+    let g = gaming::check_state(ctx, gpus, form);
     ui.set_state_gaming_applied(g.is_active());
     ui.set_state_gaming_pending_reboot(g.is_pending_reboot());
 }

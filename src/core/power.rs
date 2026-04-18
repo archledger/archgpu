@@ -85,6 +85,12 @@ pub fn modprobe_content(form: FormFactor) -> String {
     s.push_str("# Managed by archgpu — do not edit by hand.\n");
     s.push_str("# Required on all hosts to avoid Wayland wake artifacts.\n");
     s.push_str("options nvidia NVreg_UseKernelSuspendNotifiers=1\n");
+    // Phase 18: preserve VRAM contents across suspend/hibernate. Without this,
+    // `nvidia-suspend.service`'s write to `/proc/driver/nvidia/suspend` silently
+    // does nothing and GNOME Wayland returns to a black screen on resume
+    // (observed on the RTX 3060 hybrid host during the Phase 18 bug report).
+    s.push_str("# Preserve VRAM across suspend — required companion to nvidia-suspend.service.\n");
+    s.push_str("options nvidia NVreg_PreserveVideoMemoryAllocations=1\n");
     if form == FormFactor::Laptop {
         s.push_str("# Hybrid-graphics dynamic power management (laptops only).\n");
         s.push_str("options nvidia NVreg_DynamicPowerManagement=0x02\n");
@@ -148,6 +154,17 @@ mod tests {
     fn unknown_form_treated_as_non_laptop() {
         let s = modprobe_content(FormFactor::Unknown);
         assert!(!s.contains("NVreg_DynamicPowerManagement"));
+    }
+
+    #[test]
+    fn all_form_factors_set_preserve_video_memory() {
+        // Phase 18: required on every NVIDIA host for Wayland-suspend correctness.
+        for form in [FormFactor::Desktop, FormFactor::Laptop, FormFactor::Unknown] {
+            assert!(
+                modprobe_content(form).contains("NVreg_PreserveVideoMemoryAllocations=1"),
+                "form {form:?} missing PreserveVideoMemoryAllocations",
+            );
+        }
     }
 
     #[test]

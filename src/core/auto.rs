@@ -28,7 +28,7 @@ pub fn recommend(ctx: &Context, form: FormFactor, gpus: &GpuInventory) -> Action
         wayland: wayland_applicable && wayland::check_state(ctx, gpus).is_unapplied(),
         bootloader: bootloader_applicable && bootloader::check_state(ctx, gpus).is_unapplied(),
         power: power_applicable && power::check_state(ctx, gpus).is_unapplied(),
-        gaming: gaming_applicable && gaming::check_state(ctx, gpus).is_unapplied(),
+        gaming: gaming_applicable && gaming::check_state(ctx, gpus, form).is_unapplied(),
     }
 }
 
