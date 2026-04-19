@@ -35,17 +35,31 @@ pub const NVIDIA_DRM_PARAM: &str = "nvidia-drm.modeset=1";
 pub const NVIDIA_DRM_FBDEV_PARAM: &str = "nvidia-drm.fbdev=1";
 pub const AMD_PPFEATUREMASK_PARAM: &str = "amdgpu.ppfeaturemask=0xffffffff";
 pub const I915_ENABLE_GUC_PARAM: &str = "i915.enable_guc=3";
+// Phase 21: disables kernel-level Indirect Branch Tracking enforcement. Needed on
+// CET-IBT-capable CPUs (Alder Lake+ Intel, Zen 4+ AMD) running older NVIDIA drivers
+// whose indirect calls don't respect ENDBR landing pads. Arch Wiki recipe:
+// https://wiki.archlinux.org/title/NVIDIA/Troubleshooting — modern drivers (545+)
+// handle IBT natively, but the param is a harmless guard on those and load-bearing
+// on legacy ones (nvidia-470xx-dkms, nvidia-390xx-dkms).
+pub const IBT_OFF_PARAM: &str = "ibt=off";
 
 /// Enumerate the kernel command-line parameters this host should carry, based on its
-/// GPU inventory and each GPU's kernel driver. Returns an empty Vec for hosts whose
-/// only GPU(s) don't benefit from any cmdline tweak (e.g. Intel-xe only).
+/// GPU inventory, each GPU's kernel driver, AND the CPU's CET-IBT capability. Returns
+/// an empty Vec for hosts whose only GPU(s) don't benefit from any cmdline tweak
+/// (e.g. Intel-xe only, no NVIDIA, non-IBT CPU).
 ///
 /// This is the SINGLE source of truth consumed by `apply()` and `check_state()`.
-pub fn required_kernel_params(gpus: &GpuInventory) -> Vec<&'static str> {
+pub fn required_kernel_params(gpus: &GpuInventory, cpu_has_ibt: bool) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     if gpus.has_nvidia() {
         out.push(NVIDIA_DRM_PARAM);
         out.push(NVIDIA_DRM_FBDEV_PARAM);
+        // Phase 21: CET-IBT + NVIDIA combo — the Arch Wiki / NVIDIA forum workaround.
+        // Gated on has_nvidia so IBT-capable AMD / Intel-only hosts don't needlessly
+        // lose CPU-level branch protection.
+        if cpu_has_ibt {
+            out.push(IBT_OFF_PARAM);
+        }
     }
     if gpus.has_amd_amdgpu() {
         out.push(AMD_PPFEATUREMASK_PARAM);
@@ -112,7 +126,8 @@ pub fn detect_active_bootloader(ctx: &Context) -> BootloaderType {
 // ── Read-only state probe (used by diagnostics, auto::recommend, and the GUI) ──────────────
 
 pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
-    let params = required_kernel_params(gpus);
+    let cpu_has_ibt = crate::core::cpu::cpu_has_ibt(&ctx.paths.cpuinfo);
+    let params = required_kernel_params(gpus, cpu_has_ibt);
     if params.is_empty() {
         // No applicable GPU (Intel-xe-only, or no GPU at all) → this tweak
         // doesn't apply to this host. UI shows an "Unsupported" badge.
@@ -310,7 +325,8 @@ pub fn apply(
     gpus: &GpuInventory,
     progress: &mut dyn FnMut(&str),
 ) -> Result<ChangeReport> {
-    let params = required_kernel_params(gpus);
+    let cpu_has_ibt = crate::core::cpu::cpu_has_ibt(&ctx.paths.cpuinfo);
+    let params = required_kernel_params(gpus, cpu_has_ibt);
     if params.is_empty() {
         return Ok(ChangeReport::AlreadyApplied {
             detail: "no cmdline params needed for this host's GPU inventory".to_string(),
@@ -1380,27 +1396,28 @@ MODULE_PATH=boot():/initramfs-linux.img
 
     #[test]
     fn required_kernel_params_nvidia_only() {
-        let p = required_kernel_params(&nvidia_inv());
+        let p = required_kernel_params(&nvidia_inv(), false);
         assert!(p.contains(&NVIDIA_DRM_PARAM));
         assert!(p.contains(&NVIDIA_DRM_FBDEV_PARAM));
+        assert!(!p.contains(&IBT_OFF_PARAM));
         assert_eq!(p.len(), 2);
     }
 
     #[test]
     fn required_kernel_params_intel_xe_is_empty() {
         // Phase 15: xe driver handles GuC/HuC natively — no params needed.
-        assert!(required_kernel_params(&intel_xe_inv()).is_empty());
+        assert!(required_kernel_params(&intel_xe_inv(), false).is_empty());
     }
 
     #[test]
     fn required_kernel_params_intel_i915_gets_guc() {
-        let p = required_kernel_params(&intel_i915_inv());
+        let p = required_kernel_params(&intel_i915_inv(), false);
         assert_eq!(p, vec![I915_ENABLE_GUC_PARAM]);
     }
 
     #[test]
     fn required_kernel_params_amdgpu_gets_ppfeaturemask() {
-        let p = required_kernel_params(&amd_amdgpu_inv());
+        let p = required_kernel_params(&amd_amdgpu_inv(), false);
         assert_eq!(p, vec![AMD_PPFEATUREMASK_PARAM]);
     }
 
@@ -1423,10 +1440,39 @@ MODULE_PATH=boot():/initramfs-linux.img
                 },
             ],
         };
-        let p = required_kernel_params(&inv);
+        let p = required_kernel_params(&inv, false);
         assert!(p.contains(&NVIDIA_DRM_PARAM));
         assert!(p.contains(&NVIDIA_DRM_FBDEV_PARAM));
         assert!(!p.contains(&I915_ENABLE_GUC_PARAM));
+    }
+
+    // ── Phase 21: CET-IBT workaround tests ────────────────────────────────────────────────
+
+    #[test]
+    fn required_kernel_params_nvidia_on_ibt_cpu_adds_ibt_off() {
+        // Alder Lake+ / Zen 4+ CPU with an NVIDIA GPU → the Arch Wiki recipe kicks in.
+        let p = required_kernel_params(&nvidia_inv(), true);
+        assert!(p.contains(&NVIDIA_DRM_PARAM));
+        assert!(p.contains(&NVIDIA_DRM_FBDEV_PARAM));
+        assert!(
+            p.contains(&IBT_OFF_PARAM),
+            "NVIDIA + CET-IBT CPU must emit ibt=off, got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn required_kernel_params_no_nvidia_on_ibt_cpu_does_not_add_ibt_off() {
+        // Intel-xe-only or AMD-only host, even if IBT is present on the CPU, must NOT
+        // weaken branch-tracking globally. `ibt=off` is gated on NVIDIA presence.
+        assert!(!required_kernel_params(&intel_xe_inv(), true).contains(&IBT_OFF_PARAM));
+        assert!(!required_kernel_params(&amd_amdgpu_inv(), true).contains(&IBT_OFF_PARAM));
+    }
+
+    #[test]
+    fn required_kernel_params_nvidia_on_non_ibt_cpu_does_not_add_ibt_off() {
+        // Zen 3 / pre-Alder-Lake / ARM hosts with an NVIDIA card don't need the
+        // workaround — the CPU isn't enforcing IBT, so ibt=off would be dead weight.
+        assert!(!required_kernel_params(&nvidia_inv(), false).contains(&IBT_OFF_PARAM));
     }
 
     #[test]

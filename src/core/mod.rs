@@ -1,6 +1,7 @@
 pub mod aur;
 pub mod auto;
 pub mod bootloader;
+pub mod cpu;
 pub mod diagnostics;
 pub mod gaming;
 pub mod gpu;
@@ -43,6 +44,7 @@ pub struct SystemPaths {
     pub kernel_cmdline: PathBuf,
     pub pacman_conf: PathBuf,
     pub dmi_chassis: PathBuf,
+    pub cpuinfo: PathBuf, // Phase 21: CET-IBT probe via /proc/cpuinfo flags
     pub backup_dir: PathBuf,
     // Phase 17: live-kernel-state probe. `sys_module` is the root of the /sys/module tree;
     // specific params live under <sys_module>/<module>/parameters/<name>. A missing
@@ -69,6 +71,7 @@ impl SystemPaths {
             kernel_cmdline: PathBuf::from("/etc/kernel/cmdline"),
             pacman_conf: PathBuf::from("/etc/pacman.conf"),
             dmi_chassis: PathBuf::from("/sys/class/dmi/id/chassis_type"),
+            cpuinfo: PathBuf::from("/proc/cpuinfo"),
             backup_dir: PathBuf::from("/var/backups/archgpu"),
             sys_module: PathBuf::from("/sys/module"),
             grub_default: PathBuf::from("/etc/default/grub"),
@@ -97,6 +100,7 @@ impl SystemPaths {
             kernel_cmdline: root.join("etc/kernel/cmdline"),
             pacman_conf: root.join("etc/pacman.conf"),
             dmi_chassis: root.join("sys/class/dmi/id/chassis_type"),
+            cpuinfo: root.join("proc/cpuinfo"),
             backup_dir: root.join("var/backups/archgpu"),
             sys_module: root.join("sys/module"),
             grub_default: root.join("etc/default/grub"),
