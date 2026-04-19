@@ -314,8 +314,19 @@ fn populate_detection(ui: &MainWindow) {
     let gpus = GpuInventory::detect().unwrap_or_default();
     let has_nvidia = gpus.has_nvidia();
     ui.set_has_nvidia(has_nvidia);
+    ui.set_has_amd(gpus.has_amd());
+    ui.set_has_intel(gpus.has_intel());
+    ui.set_has_intel_i915(gpus.has_intel_i915());
     ui.set_is_hybrid(gpus.is_hybrid());
     ui.set_gpus_text(SharedString::from(format_gpu_inventory(&gpus)));
+
+    // Per-vendor detail strings for the new tabbed UI. Each line summarizes the detected
+    // GPU + (for NVIDIA) the driver variant the tool will install. Empty when the vendor
+    // isn't present — the corresponding tab is hidden anyway via has-* guards.
+    ui.set_nvidia_detail_text(SharedString::from(format_nvidia_detail(&gpus)));
+    ui.set_nvidia_driver_recommendation(SharedString::from(format_nvidia_driver_recommendation(&gpus)));
+    ui.set_amd_detail_text(SharedString::from(format_amd_detail(&gpus)));
+    ui.set_intel_detail_text(SharedString::from(format_intel_detail(&gpus)));
 
     // Bootloader type + source path
     let bt = bootloader::detect_active_bootloader(&ctx);
@@ -415,6 +426,78 @@ fn describe_bootloader_source(ctx: &Context, bt: BootloaderType) -> String {
             .map(|p| format!("cmdline in {}", p.display()))
             .unwrap_or_else(|| "limine.conf not found".to_string()),
         BootloaderType::Unknown => "no supported bootloader detected".to_string(),
+    }
+}
+
+/// NVIDIA-specific detail line for the NVIDIA tab's detection card. Summarizes the
+/// primary NVIDIA GPU's product name + architecture generation. Empty when no NVIDIA
+/// GPU is detected (the NVIDIA tab is hidden in that case).
+fn format_nvidia_detail(gpus: &GpuInventory) -> String {
+    let Some(nv) = gpus.primary_nvidia() else {
+        return String::new();
+    };
+    let gen = nv
+        .nvidia_gen
+        .map(|g| format!(" · {}", g.human()))
+        .unwrap_or_default();
+    format!("{}{gen}", nv.display_name())
+}
+
+/// NVIDIA driver-package recommendation line. Resolves the per-architecture driver
+/// (nvidia-open-dkms for Turing+, nvidia-dkms for Pascal/Volta, AUR legacy for
+/// Maxwell/Kepler/Fermi). Empty when there's no NVIDIA GPU or no recommendation.
+fn format_nvidia_driver_recommendation(gpus: &GpuInventory) -> String {
+    let Some(nv) = gpus.primary_nvidia() else {
+        return String::new();
+    };
+    let Some(rec) = nv.recommended_nvidia_package() else {
+        return String::new();
+    };
+    let tag = match rec.source {
+        PackageSource::Official => "repo",
+        PackageSource::Aur => "AUR",
+        PackageSource::Unsupported => "EOL",
+    };
+    format!("{} ({tag}) — {}", rec.package, rec.note)
+}
+
+/// AMD-specific detail line. Names every detected AMD GPU and its kernel driver so
+/// users on hybrids can see exactly what amdgpu is bound to.
+fn format_amd_detail(gpus: &GpuInventory) -> String {
+    let amds: Vec<String> = gpus
+        .gpus
+        .iter()
+        .filter(|g| matches!(g.vendor, crate::core::gpu::GpuVendor::Amd))
+        .map(|g| {
+            let driver = g.kernel_driver.as_deref().unwrap_or("(none)");
+            let tag = if g.is_integrated { "iGPU" } else { "dGPU" };
+            format!("{}  ·  {tag}  ·  kernel driver: {driver}", g.display_name())
+        })
+        .collect();
+    if amds.is_empty() {
+        String::new()
+    } else {
+        amds.join("\n")
+    }
+}
+
+/// Intel-specific detail line. Shows the kernel driver (i915 vs xe) so users know
+/// whether the cmdline tweak (i915-only) applies to them.
+fn format_intel_detail(gpus: &GpuInventory) -> String {
+    let intels: Vec<String> = gpus
+        .gpus
+        .iter()
+        .filter(|g| matches!(g.vendor, crate::core::gpu::GpuVendor::Intel))
+        .map(|g| {
+            let driver = g.kernel_driver.as_deref().unwrap_or("(none)");
+            let tag = if g.is_integrated { "iGPU" } else { "dGPU" };
+            format!("{}  ·  {tag}  ·  kernel driver: {driver}", g.display_name())
+        })
+        .collect();
+    if intels.is_empty() {
+        String::new()
+    } else {
+        intels.join("\n")
     }
 }
 

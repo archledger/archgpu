@@ -126,6 +126,46 @@ component StateBadge inherits Rectangle {
     }
 }
 
+// ── Tab button: libadwaita-style pill with accent when active ──────────────────────────────
+// Used by the tab strip under the hero to switch between Overview / NVIDIA / AMD / Intel.
+// Active tab gets the GNOME Blue accent; inactive tabs are muted dark.
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 36px;
+    border-radius: 8px;
+    background: !root.enabled
+        ? #252525
+        : (root.active
+            ? #3584E4
+            : (tb.pressed ? #3A3A3A : (tb.has-hover ? #333333 : #262626)));
+    animate background { duration: 120ms; easing: ease-in-out; }
+
+    tb := TouchArea {
+        enabled: root.enabled && !root.active;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled && !root.active ? pointer : default;
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        padding-left: 16px;
+        padding-right: 16px;
+        Text {
+            text: root.text;
+            color: root.enabled
+                ? (root.active ? #FFFFFF : #C8C8C8)
+                : #6A6A6A;
+            font-size: 13px;
+            font-weight: root.active ? 700 : 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
 // ── Tweak row: bold title + gray subtitle on the left, Switch (or status badge) on right ────
 component TweakRow inherits HorizontalLayout {
     in property <string> title;
@@ -266,7 +306,23 @@ export component MainWindow inherits Window {
     in-out property <string> gpus-text: "Detecting...";
     in-out property <bool> is-laptop: false;
     in-out property <bool> has-nvidia: false;
+    in-out property <bool> has-amd: false;
+    in-out property <bool> has-intel: false;
+    in-out property <bool> has-intel-i915: false;
     in-out property <bool> is-hybrid: false;
+
+    // Per-vendor detail lines rendered in each vendor tab's detection card. Populated
+    // from GpuInventory by gui::populate_detection — e.g. "RTX 3060 (Ampere) · driver:
+    // nvidia-open-dkms (Turing+)".
+    in-out property <string> nvidia-detail-text: "";
+    in-out property <string> nvidia-driver-recommendation: "";
+    in-out property <string> amd-detail-text: "";
+    in-out property <string> intel-detail-text: "";
+
+    // Tabbed UI: which vendor page is visible. 0 = Overview, 1 = NVIDIA, 2 = AMD, 3 = Intel.
+    // Tabs for undetected vendors are hidden by their respective `has-*` guards, so user
+    // only sees what's relevant to their hardware.
+    in-out property <int> current-tab: 0;
 
     // ── Run state ──────────────────────────────────────────────────────────────────────────
     in-out property <string> log-text: "";
@@ -361,212 +417,429 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // ── HARDWARE card ──────────────────────────────────────────────────────────
-                Card {
-                    Text {
-                        text: "Detected hardware";
-                        color: #FFFFFF;
-                        font-size: 15px;
-                        font-weight: 700;
+                // ── TAB BAR ────────────────────────────────────────────────────────────────
+                // Tabs for undetected vendors stay hidden so a typical Arch user sees exactly
+                // the tabs that matter to their hardware. Multi-vendor hosts (hybrid / desktop
+                // NVIDIA+iGPU) see all the relevant tabs.
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    TabButton {
+                        text: "Overview";
+                        active: root.current-tab == 0;
+                        enabled: !root.is-working;
+                        clicked => { root.current-tab = 0; }
                     }
-                    Text {
-                        text: "Chassis:  " + root.chassis-text;
-                        color: #C8C8C8;
-                        font-size: 13px;
+                    if root.has-nvidia : TabButton {
+                        text: "NVIDIA";
+                        active: root.current-tab == 1;
+                        enabled: !root.is-working;
+                        clicked => { root.current-tab = 1; }
                     }
-                    Text {
-                        text: root.gpus-text;
-                        color: #A0A0A0;
-                        font-size: 12px;
-                        wrap: word-wrap;
+                    if root.has-amd : TabButton {
+                        text: "AMD";
+                        active: root.current-tab == 2;
+                        enabled: !root.is-working;
+                        clicked => { root.current-tab = 2; }
                     }
-                    Text {
-                        text: "Bootloader:  " + root.bootloader-type-text + "  ·  " + root.bootloader-text;
-                        color: #A0A0A0;
-                        font-size: 12px;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { height: 6px; background: transparent; }
-                    Text {
-                        text: root.has-nvidia
-                            ? (root.is-hybrid
-                                ? "● NVIDIA + integrated iGPU (hybrid / Optimus)"
-                                : "● NVIDIA dGPU present")
-                            : "● No NVIDIA GPU — NVIDIA-specific actions will be skipped";
-                        color: root.has-nvidia ? #7CC47C : #E8944B;
-                        font-weight: 700;
-                        font-size: 12px;
+                    if root.has-intel : TabButton {
+                        text: "Intel";
+                        active: root.current-tab == 3;
+                        enabled: !root.is-working;
+                        clicked => { root.current-tab = 3; }
                     }
                 }
 
-                // ── ATTENTION: self-heal needed (Phase 20 / UI overhaul) ───────────────────
-                // Only visible when the repair scanner detected legacy archgpu artifacts on
-                // this host (stale PRIME drop-in, misplaced nvidia-prime, broken DKMS module).
-                // Red-amber styled so it reads as "fix before doing anything else." The
-                // dedicated Run Repair Now button bypasses the regular apply flow — single
-                // click, fires run-repair(), re-detects, and the card dismisses itself when
-                // the scanner returns empty on the next populate.
-                if root.repair-action-count > 0 : Rectangle {
-                    background: #3A1F1F;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: #9A3030;
+                // ── OVERVIEW TAB ───────────────────────────────────────────────────────────
+                // Hardware + status signals (Attention, Sanitation) + summary. No tweak
+                // toggles here — users navigate to a vendor tab to configure, or click
+                // Auto-Optimize above for one-click cross-vendor recommendation.
+                if root.current-tab == 0 : VerticalLayout {
+                    spacing: 12px;
 
-                    VerticalLayout {
-                        padding: 18px;
-                        spacing: 10px;
-
-                        HorizontalLayout {
-                            spacing: 10px;
-                            alignment: start;
-                            Text {
-                                text: "⚠";
-                                color: #FF8E7A;
-                                font-size: 20px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                text: root.repair-action-count + " legacy artifact" + (root.repair-action-count == 1 ? "" : "s") + " from a previous ArchGPU version";
-                                color: #FF9B85;
-                                font-size: 15px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
+                    // Hardware card
+                    Card {
+                        Text {
+                            text: "Detected hardware";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
                         }
                         Text {
-                            text: "Older versions of ArchGPU left state on this host that can misroute display on hybrid desktops or keep the NVIDIA GPU driverless. Run repair before re-applying other tweaks. Every action is backed up under /var/backups/archgpu/ and idempotent.";
-                            color: #F5C4B8;
+                            text: "Chassis:  " + root.chassis-text;
+                            color: #C8C8C8;
+                            font-size: 13px;
+                        }
+                        Text {
+                            text: root.gpus-text;
+                            color: #A0A0A0;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
-
-                        Rectangle { height: 2px; background: transparent; }
-
-                        for summary in root.repair-summaries : Text {
-                            text: "•  " + summary;
-                            color: #F5DFD8;
+                        Text {
+                            text: "Bootloader:  " + root.bootloader-type-text + "  ·  " + root.bootloader-text;
+                            color: #A0A0A0;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
-
                         Rectangle { height: 6px; background: transparent; }
+                        Text {
+                            text: root.has-nvidia
+                                ? (root.is-hybrid
+                                    ? "● NVIDIA + integrated iGPU (hybrid / Optimus)"
+                                    : "● NVIDIA dGPU present")
+                                : "● No NVIDIA GPU — NVIDIA tab hidden; tune per-vendor settings on the AMD / Intel tab";
+                            color: root.has-nvidia ? #7CC47C : #E8944B;
+                            font-weight: 700;
+                            font-size: 12px;
+                        }
+                    }
 
-                        HeroButton {
-                            text: "🛠  Run Repair Now";
-                            enabled: !root.is-working;
-                            clicked => { root.run-repair(); }
+                    // Attention card — red-amber, only when repair scanner detected stale artifacts.
+                    if root.repair-action-count > 0 : Rectangle {
+                        background: #3A1F1F;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #9A3030;
+
+                        VerticalLayout {
+                            padding: 18px;
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+                                Text {
+                                    text: "⚠";
+                                    color: #FF8E7A;
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.repair-action-count + " legacy artifact" + (root.repair-action-count == 1 ? "" : "s") + " from a previous ArchGPU version";
+                                    color: #FF9B85;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                text: "Older versions of ArchGPU left state on this host that can misroute display on hybrid desktops or keep the NVIDIA GPU driverless. Run repair before re-applying other tweaks. Every action is backed up under /var/backups/archgpu/ and idempotent.";
+                                color: #F5C4B8;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            Rectangle { height: 2px; background: transparent; }
+                            for summary in root.repair-summaries : Text {
+                                text: "•  " + summary;
+                                color: #F5DFD8;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            Rectangle { height: 6px; background: transparent; }
+                            HeroButton {
+                                text: "🛠  Run Repair Now";
+                                enabled: !root.is-working;
+                                clicked => { root.run-repair(); }
+                            }
+                        }
+                    }
+
+                    // Sanitation — amber, only when sanitation scanner detected legacy cruft.
+                    if root.sanitation-warnings.length > 0 : Rectangle {
+                        background: #3C2A1A;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: #8A5A20;
+
+                        VerticalLayout {
+                            padding: 18px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "⚠";
+                                    color: #FFC66E;
+                                    font-size: 18px;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: "Legacy configuration detected";
+                                    color: #FFC66E;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                text: "These settings follow outdated tutorials and may degrade performance or break modern Wayland. Review and remediate before applying new tweaks.";
+                                color: #E8D4B0;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            for warn[i] in root.sanitation-warnings : Text {
+                                text: "•  " + warn;
+                                color: #F5DFB8;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    // Summary card — tells user what Apply will do right now.
+                    Card {
+                        Text {
+                            text: "Summary";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.selected-action-count == 0
+                                ? "No actions selected. Open a vendor tab above to configure specific tweaks, or click Auto-Optimize for a one-click recommendation across every detected GPU."
+                                : (root.opt-dry-run
+                                    ? "Dry-run ready — clicking Preview below will show exactly what would happen for the " + root.selected-action-count + " selected action" + (root.selected-action-count == 1 ? "" : "s") + " without writing anything."
+                                    : "Apply ready — clicking Apply below will execute " + root.selected-action-count + " action" + (root.selected-action-count == 1 ? "" : "s") + ". Every file write is backed up under /var/backups/archgpu/.");
+                            color: root.selected-action-count == 0 ? #A0A0A0 : #C8E0C8;
+                            font-size: 12px;
+                            wrap: word-wrap;
                         }
                     }
                 }
 
-                // ── SANITATION WARNING card (Phase 15/16) ──────────────────────────────────
-                // Only visible when backend detected at least one legacy/conflicting config.
-                // Styled amber-on-dark so users can't miss it without blocking the UI.
-                if root.sanitation-warnings.length > 0 : Rectangle {
-                    background: #3C2A1A;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: #8A5A20;
+                // ── NVIDIA TAB ─────────────────────────────────────────────────────────────
+                // Everything that touches the NVIDIA driver / Wayland env / suspend tuning.
+                // The cmdline toggle is shared with AMD/Intel tabs (same opt-bootloader bool)
+                // — bootloader::apply composes per-vendor params into a single cmdline write.
+                if root.current-tab == 1 && root.has-nvidia : VerticalLayout {
+                    spacing: 12px;
 
-                    VerticalLayout {
-                        padding: 18px;
-                        spacing: 8px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: "⚠";
-                                color: #FFC66E;
-                                font-size: 18px;
-                                font-weight: 700;
-                            }
-                            Text {
-                                text: "Legacy configuration detected";
-                                color: #FFC66E;
-                                font-size: 14px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
+                    // NVIDIA detection card (subtle green — NVIDIA brand adjacent).
+                    Card {
+                        fill: #1E3228;
+                        Text {
+                            text: "NVIDIA GPU";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
                         }
                         Text {
-                            text: "These settings follow outdated tutorials and may degrade performance or break modern Wayland. Review and remediate before applying new tweaks.";
-                            color: #E8D4B0;
+                            text: root.nvidia-detail-text;
+                            color: #C8E0C8;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        if root.nvidia-driver-recommendation != "" : Text {
+                            text: "Recommended driver:  " + root.nvidia-driver-recommendation;
+                            color: #A0C8A0;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        if root.is-hybrid && root.is-laptop : Text {
+                            text: "● Hybrid laptop — PRIME render offload (prime-run) will be configured for Optimus workloads.";
+                            color: #A0C8A0;
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        for warn[i] in root.sanitation-warnings : Text {
-                            text: "•  " + warn;
-                            color: #F5DFB8;
-                            font-size: 12px;
+                        if root.is-hybrid && !root.is-laptop : Text {
+                            text: "● Hybrid desktop — PRIME skipped. On a tower the physical display cable dictates the primary GPU; PRIME OutputClass drop-ins would misroute.";
+                            color: #E8C474;
+                            font-size: 11px;
                             wrap: word-wrap;
+                        }
+                    }
+
+                    // NVIDIA tweaks card
+                    Card {
+                        Text {
+                            text: "NVIDIA tweaks";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+
+                        TweakRow {
+                            title: "Wayland environment + initramfs modules";
+                            subtitle: "Writes the modern comment-only /etc/profile.d drop-in (no more legacy GBM_BACKEND global — that breaks hybrid PRIME), adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to initramfs via MODULES+=() (never touches HOOKS — that would break simpledrm consoles), and drops a PRIME Xorg OutputClass on hybrid LAPTOPS only.";
+                            checked <=> root.opt-wayland;
+                            enabled: !root.is-working;
+                            applied: root.state-wayland-applied;
+                            pending_reboot: root.state-wayland-pending-reboot;
+                            incompatible: root.state-wayland-incompatible;
+                        }
+
+                        Rectangle { height: 1px; background: #333333; }
+
+                        TweakRow {
+                            title: "Kernel command line — NVIDIA params";
+                            subtitle: "Verifies nvidia_drm.modeset=1 and fbdev=1 (native Wayland + hi-res TTY). Note: Modern nvidia-utils (560+) handle this via modprobe automatically; bootloader injection is only used as a fallback. Writes to the detected bootloader (GRUB / systemd-boot / Limine / UKI) when needed and regenerates. Reports Active only when the running kernel confirms via /sys/module/nvidia_drm/parameters/.";
+                            checked <=> root.opt-bootloader;
+                            enabled: !root.is-working;
+                            applied: root.state-bootloader-applied;
+                            pending_reboot: root.state-bootloader-pending-reboot;
+                            incompatible: root.state-bootloader-incompatible;
+                        }
+
+                        Rectangle { height: 1px; background: #333333; }
+
+                        TweakRow {
+                            title: root.is-laptop
+                                ? "Suspend/hibernate + hybrid power tweaks  ·  laptop"
+                                : "Suspend/hibernate + modprobe tweaks";
+                            subtitle: "Enables nvidia-suspend / nvidia-hibernate / nvidia-resume systemd units. Writes modprobe drop-in: NVreg_UseKernelSuspendNotifiers=1 (required everywhere for Wayland wake), NVreg_PreserveVideoMemoryAllocations=1 (prevents black screen on resume — companion to nvidia-suspend.service), NVreg_DynamicPowerManagement=0x02 (laptops only). Blacklists nouveau to prevent module conflicts.";
+                            checked <=> root.opt-power;
+                            enabled: !root.is-working;
+                            applied: root.state-power-applied;
+                            pending_reboot: root.state-power-pending-reboot;
+                            incompatible: root.state-power-incompatible;
+                        }
+
+                        Rectangle { height: 1px; background: #333333; }
+
+                        TweakRow {
+                            title: "NVIDIA gaming stack";
+                            subtitle: "Installs nvidia-utils + lib32-nvidia-utils + nvidia-settings + libva-nvidia-driver (VA-API). Driver variant picked from GPU architecture: nvidia-open-dkms (Turing+), nvidia-dkms (Pascal/Volta), or AUR legacy (nvidia-470xx-dkms / nvidia-390xx-dkms) bootstrapped via yay. Kernel headers for every installed kernel auto-queued so DKMS never silently fails.";
+                            checked <=> root.opt-gaming;
+                            enabled: !root.is-working;
+                            applied: root.state-gaming-applied;
+                            pending_reboot: root.state-gaming-pending-reboot;
+                            incompatible: false;
                         }
                     }
                 }
 
-                // ── TWEAKS card ────────────────────────────────────────────────────────────
-                Card {
-                    Text {
-                        text: "Tweaks";
-                        color: #FFFFFF;
-                        font-size: 15px;
-                        font-weight: 700;
+                // ── AMD TAB ────────────────────────────────────────────────────────────────
+                // amdgpu cmdline tuning + RADV/libva-mesa gaming stack. No Wayland/Power
+                // rows — AMD works out of the box with Mesa + kernel modesetting, nothing
+                // for this tool to configure on that axis.
+                if root.current-tab == 2 && root.has-amd : VerticalLayout {
+                    spacing: 12px;
+
+                    Card {
+                        fill: #322020;
+                        Text {
+                            text: "AMD GPU";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.amd-detail-text;
+                            color: #E0C8C8;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "AMD hardware works out of the box with Mesa + amdgpu — no driver install needed, no suspend tweaks, no Wayland env vars. This tab covers the two things this tool CAN usefully do: unlock power-feature bits via cmdline, and install the Vulkan + VA-API userspace stack.";
+                            color: #C8A0A0;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
                     }
 
-                    TweakRow {
-                        title: "Wayland environment + initramfs modules";
-                        subtitle: "Writes the modern comment-only /etc/profile.d drop-in (no more legacy GBM_BACKEND global export — breaks hybrid PRIME), adds nvidia / nvidia_modeset / nvidia_uvm / nvidia_drm to initramfs via MODULES+=() (never touches HOOKS — that would break simpledrm consoles), and drops a PRIME Xorg outputclass on hybrid hosts.";
-                        checked <=> root.opt-wayland;
-                        enabled: !root.is-working;
-                        applied: root.state-wayland-applied;
-                        pending_reboot: root.state-wayland-pending-reboot;
-                        incompatible: root.state-wayland-incompatible;
+                    Card {
+                        Text {
+                            text: "AMD tweaks";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+
+                        TweakRow {
+                            title: "Kernel command line — AMD params";
+                            subtitle: "Adds amdgpu.ppfeaturemask=0xffffffff — unlocks CoreCtrl, MorePowerTool, and all clock/voltage registers for overclocking/undervolting tools. Writes to the detected bootloader (GRUB / systemd-boot / Limine / UKI) and regenerates. Reports Active only when /sys/module/amdgpu/parameters/ppfeaturemask confirms.";
+                            checked <=> root.opt-bootloader;
+                            enabled: !root.is-working;
+                            applied: root.state-bootloader-applied;
+                            pending_reboot: root.state-bootloader-pending-reboot;
+                            incompatible: root.state-bootloader-incompatible;
+                        }
+
+                        Rectangle { height: 1px; background: #333333; }
+
+                        TweakRow {
+                            title: "AMD gaming stack";
+                            subtitle: "Installs vulkan-radeon + lib32-vulkan-radeon (RADV — Mesa's Vulkan driver, consistently faster than AMD's AMDVLK in Proton/Steam benchmarks) and libva-mesa-driver + lib32-libva-mesa-driver (VA-API; mesa-vdpau was removed in Mesa 25 — this is the successor). Plus gamemode / mangohud and the [multilib] + vm.max_map_count system-wide tuning.";
+                            checked <=> root.opt-gaming;
+                            enabled: !root.is-working;
+                            applied: root.state-gaming-applied;
+                            pending_reboot: root.state-gaming-pending-reboot;
+                            incompatible: false;
+                        }
                     }
-
-                    Rectangle { height: 1px; background: #333333; }
-
-                    TweakRow {
-                        title: "Kernel command line (GPU-aware; live-verified)";
-                        subtitle: "Verifies nvidia_drm.modeset=1 and fbdev=1. Note: Modern nvidia-utils (560+) handle this via modprobe automatically; bootloader injection is only used as a fallback. AMD amdgpu: amdgpu.ppfeaturemask=0xffffffff (unlocks CoreCtrl). Intel i915: i915.enable_guc=3 (GuC + HuC). Intel xe: no params — handled natively. Writes to the detected bootloader (GRUB/systemd-boot/Limine/UKI) when needed and regenerates. Reports Active only when the running kernel confirms the param (via /sys/module/<m>/parameters/<p>) — otherwise Reboot pending.";
-                        checked <=> root.opt-bootloader;
-                        enabled: !root.is-working;
-                        applied: root.state-bootloader-applied;
-                        pending_reboot: root.state-bootloader-pending-reboot;
-                        incompatible: root.state-bootloader-incompatible;
-                    }
-
-                    Rectangle { height: 1px; background: #333333; }
-
-                    TweakRow {
-                        title: root.is-laptop
-                            ? "Suspend/hibernate fix + hybrid power tweaks  ·  laptop"
-                            : "Suspend/hibernate fix + modprobe tweaks";
-                        subtitle: "Enables nvidia-suspend / nvidia-hibernate / nvidia-resume systemd units, writes NVreg_UseKernelSuspendNotifiers (all hosts) and NVreg_DynamicPowerManagement=0x02 (laptops only), and blacklists nouveau.";
-                        checked <=> root.opt-power;
-                        enabled: !root.is-working;
-                        applied: root.state-power-applied;
-                        pending_reboot: root.state-power-pending-reboot;
-                        incompatible: root.state-power-incompatible;
-                    }
-
-                    Rectangle { height: 1px; background: #333333; }
-
-                    TweakRow {
-                        title: "Gaming setup — multilib, Vulkan, gamemode, mangohud";
-                        subtitle: "Uncomments [multilib], installs per-vendor Vulkan (nvidia-utils / vulkan-intel / vulkan-radeon) + 32-bit variants + gamemode + mangohud + VA-API (libva-mesa-driver / intel-media-driver / libva-nvidia-driver), writes vm.max_map_count=1048576, and builds legacy NVIDIA drivers from AUR via yay (auto-bootstrapped) when needed.";
-                        checked <=> root.opt-gaming;
-                        enabled: !root.is-working;
-                        applied: root.state-gaming-applied;
-                        pending_reboot: root.state-gaming-pending-reboot;
-                        incompatible: false;
-                    }
-
-                    // Repair is elevated out of the Tweaks list — it's remediation, not
-                    // tuning. See the Attention card above the Tweaks card for the dedicated
-                    // UI surface. opt-repair is still set by Auto-Optimize so clicking Apply
-                    // after Auto-Optimize runs repair alongside other recommended actions.
                 }
 
-                // ── OPTIONS card ───────────────────────────────────────────────────────────
+                // ── INTEL TAB ──────────────────────────────────────────────────────────────
+                // i915/xe cmdline + vulkan-intel/intel-media gaming stack. The cmdline
+                // toggle is only meaningful for i915 hosts — xe handles GuC/HuC natively, so
+                // on a pure-xe host the cmdline tweak is a no-op (bootloader::required_
+                // kernel_params returns empty for Intel xe).
+                if root.current-tab == 3 && root.has-intel : VerticalLayout {
+                    spacing: 12px;
+
+                    Card {
+                        fill: #1E2838;
+                        Text {
+                            text: "Intel GPU";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.intel-detail-text;
+                            color: #C8D4E0;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        if root.has-intel-i915 : Text {
+                            text: "● i915 driver — GuC/HuC needs explicit enable via i915.enable_guc=3.";
+                            color: #A0B8D4;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if !root.has-intel-i915 : Text {
+                            text: "● xe driver — GuC/HuC handled natively. No kernel cmdline tweaks needed.";
+                            color: #A0B8D4;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Card {
+                        Text {
+                            text: "Intel tweaks";
+                            color: #FFFFFF;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+
+                        if root.has-intel-i915 : TweakRow {
+                            title: "Kernel command line — Intel i915 params";
+                            subtitle: "Adds i915.enable_guc=3 — turns on GuC submission + HuC firmware loading. Required for hardware-accelerated video decode on Gen8+ iGPUs. Reports Active only when /sys/module/i915/parameters/enable_guc confirms.";
+                            checked <=> root.opt-bootloader;
+                            enabled: !root.is-working;
+                            applied: root.state-bootloader-applied;
+                            pending_reboot: root.state-bootloader-pending-reboot;
+                            incompatible: root.state-bootloader-incompatible;
+                        }
+
+                        if root.has-intel-i915 : Rectangle { height: 1px; background: #333333; }
+
+                        TweakRow {
+                            title: "Intel gaming stack";
+                            subtitle: "Installs vulkan-intel + lib32-vulkan-intel (Mesa's Vulkan driver) and intel-media-driver (iHD — the modern Gen8+ VA-API backend; Gen4-7 hosts needing legacy i965 should install libva-intel-driver manually). Plus gamemode / mangohud and the [multilib] + vm.max_map_count system-wide tuning.";
+                            checked <=> root.opt-gaming;
+                            enabled: !root.is-working;
+                            applied: root.state-gaming-applied;
+                            pending_reboot: root.state-gaming-pending-reboot;
+                            incompatible: false;
+                        }
+                    }
+                }
+
+                // ── OPTIONS card (always visible — affects Apply regardless of tab) ────────
                 Card {
                     Text {
                         text: "Options";
