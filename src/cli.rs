@@ -49,6 +49,13 @@ pub struct Cli {
     #[arg(long)]
     pub apply_repair: bool,
 
+    /// Phase 26: install vendor-agnostic userspace — Vulkan loader, Mesa GL,
+    /// split firmware (`linux-firmware-amdgpu` / `linux-firmware-intel`), VA-API
+    /// drivers (generation-gated on Intel), and diagnostic tools (vulkan-tools,
+    /// clinfo, libva-utils, vdpauinfo). Non-gaming; run before `--apply-gaming`.
+    #[arg(long)]
+    pub apply_essentials: bool,
+
     /// Run every apply action
     #[arg(long)]
     pub apply_all: bool,
@@ -73,6 +80,7 @@ impl Cli {
             || self.apply_power
             || self.apply_gaming
             || self.apply_repair
+            || self.apply_essentials
             || self.apply_all
     }
 
@@ -102,6 +110,7 @@ impl Cli {
             power: self.apply_power,
             gaming: self.apply_gaming,
             repair: self.apply_repair,
+            essentials: self.apply_essentials,
         }
     }
 }

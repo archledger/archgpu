@@ -1,7 +1,7 @@
 use crate::core::gaming;
 use crate::core::gpu::GpuInventory;
 use crate::core::hardware::FormFactor;
-use crate::core::{bootloader, power, repair, wayland, Actions, Context};
+use crate::core::{bootloader, essentials, power, repair, wayland, Actions, Context};
 
 /// Determine the best default action set for the detected hardware AND current system state.
 ///
@@ -32,6 +32,9 @@ pub fn recommend(ctx: &Context, form: FormFactor, gpus: &GpuInventory) -> Action
         // Phase 20: Auto-Optimize recommends repair whenever the scanner finds stale
         // artifacts. Universally applicable, so the only gate is state.
         repair: repair::check_state(ctx, gpus, form).is_unapplied(),
+        // Phase 26: essentials is universal — every host benefits from the Vulkan
+        // loader + Mesa + split firmware + diagnostic userspace. State-gated only.
+        essentials: essentials::check_state(ctx, gpus).is_unapplied(),
     }
 }
 
@@ -41,6 +44,11 @@ pub fn recommended_names(actions: Actions) -> Vec<&'static str> {
     // Repair first — matches run_actions dispatch order and flags the urgent case visibly.
     if actions.repair {
         out.push("repair");
+    }
+    // Phase 26: essentials sits between repair and the vendor-specific stages
+    // (same ordering as run_actions dispatch).
+    if actions.essentials {
+        out.push("essentials");
     }
     if actions.wayland {
         out.push("wayland");
@@ -214,6 +222,7 @@ mod tests {
             power: true,
             gaming: false,
             repair: false,
+            essentials: false,
         };
         assert_eq!(recommended_names(actions), vec!["wayland", "power"]);
     }
@@ -228,7 +237,27 @@ mod tests {
             power: false,
             gaming: true,
             repair: true,
+            essentials: false,
         };
         assert_eq!(recommended_names(actions), vec!["repair", "wayland", "gaming"]);
+    }
+
+    #[test]
+    fn recommended_names_places_essentials_between_repair_and_wayland() {
+        // Phase 26: essentials runs after repair but before vendor-specific stages.
+        // Order must match run_actions dispatch so the UI log and actual execution
+        // tell the same story.
+        let actions = Actions {
+            wayland: true,
+            bootloader: false,
+            power: false,
+            gaming: true,
+            repair: true,
+            essentials: true,
+        };
+        assert_eq!(
+            recommended_names(actions),
+            vec!["repair", "essentials", "wayland", "gaming"]
+        );
     }
 }

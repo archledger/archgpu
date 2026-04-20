@@ -3,6 +3,7 @@ pub mod auto;
 pub mod bootloader;
 pub mod cpu;
 pub mod diagnostics;
+pub mod essentials;
 pub mod gaming;
 pub mod gpu;
 pub mod hardware;
@@ -171,6 +172,11 @@ pub struct Actions {
     /// failed to build. Runs BEFORE the other actions so their state probes see a
     /// clean system. Idempotent — on a healthy host it's a no-op.
     pub repair: bool,
+    /// Phase 26: vendor-agnostic userspace baseline — Vulkan loader, Mesa GL, split
+    /// firmware packages (`linux-firmware-amdgpu` / `linux-firmware-intel`), VA-API
+    /// drivers, diagnostic tools (vulkan-tools / clinfo / libva-utils / vdpauinfo).
+    /// Non-gaming; runs before `gaming` so that stack sees a healthy base.
+    pub essentials: bool,
 }
 
 impl Actions {
@@ -181,11 +187,17 @@ impl Actions {
             power: true,
             gaming: true,
             repair: true,
+            essentials: true,
         }
     }
 
     pub fn any(&self) -> bool {
-        self.wayland || self.bootloader || self.power || self.gaming || self.repair
+        self.wayland
+            || self.bootloader
+            || self.power
+            || self.gaming
+            || self.repair
+            || self.essentials
     }
 }
 
@@ -209,6 +221,15 @@ pub fn run_actions(
     if actions.repair {
         for r in repair::apply(ctx, gpus, form, assume_yes, progress)? {
             out.push(("repair", r));
+        }
+    }
+
+    // Phase 26: essentials runs before gaming/wayland/bootloader/power so the Vulkan
+    // loader, Mesa, split firmware, and diagnostic tools are present by the time
+    // later stages run their state probes. Universally applicable.
+    if actions.essentials {
+        for r in essentials::apply(ctx, gpus, assume_yes, progress)? {
+            out.push(("essentials", r));
         }
     }
 
