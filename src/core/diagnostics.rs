@@ -240,6 +240,64 @@ pub fn scan(ctx: &Context, gpus: &GpuInventory, form: FormFactor) -> Vec<Finding
         }
     }
 
+    // Phase 23: firmware presence + compute-runtime advisories.
+    //
+    // linux-firmware is pulled in transitively by `base` on every Arch install, but on
+    // stripped-down setups (chroots, custom installs, testing images) it can be
+    // missing — and without it amdgpu / i915 / xe / nvidia all fail at module init.
+    // Warning severity because the system would be broken without it.
+    let installed_for_advisories = pacman_installed_set();
+    if !installed_for_advisories.contains("linux-firmware")
+        && !installed_for_advisories.contains("linux-firmware-nvidia")
+        && !installed_for_advisories.contains("linux-firmware-amdgpu")
+        && !installed_for_advisories.contains("linux-firmware-intel")
+    {
+        findings.push(Finding::warn(
+            "linux-firmware package not installed",
+            "None of `linux-firmware` or its per-vendor subpackages (linux-firmware-nvidia / \
+             linux-firmware-amdgpu / linux-firmware-intel) are present. Modern GPU kernel \
+             modules require firmware blobs at init time — without them amdgpu / i915 / xe / \
+             nvidia will either fail to load or operate in degraded modes.",
+            "sudo pacman -S --needed linux-firmware",
+        ));
+    }
+
+    // Compute-runtime advisories — Info severity. Users doing ML / Blender / scientific
+    // computing routinely hit "why isn't my GPU being used?" because OpenCL / CUDA / HIP
+    // runtimes aren't installed. Surface the vendor-appropriate package names without
+    // auto-installing (they're heavy — cuda is >3 GB — and many users don't need them).
+    if gpus.has_nvidia() {
+        if !installed_for_advisories.contains("opencl-nvidia") {
+            findings.push(Finding::info(
+                "OpenCL for NVIDIA not installed",
+                "Applications that use OpenCL (Blender Cycles, darktable, Resolve) require \
+                 `opencl-nvidia` (+ `lib32-opencl-nvidia` for 32-bit apps). Skip if you only game.",
+            ));
+        }
+        if !installed_for_advisories.contains("cuda") {
+            findings.push(Finding::info(
+                "CUDA toolkit for NVIDIA not installed",
+                "ML frameworks (PyTorch, TensorFlow) and many scientific apps need the CUDA \
+                 runtime. Install with `sudo pacman -S cuda` (~3 GB). Skip if you only game.",
+            ));
+        }
+    }
+    if gpus.has_amd() && !installed_for_advisories.contains("rocm-opencl-runtime") {
+        findings.push(Finding::info(
+            "ROCm / OpenCL for AMD not installed",
+            "Compute workloads on AMD require `rocm-opencl-runtime` (OpenCL) and optionally \
+             `rocm-hip-runtime` (HIP — AMD's CUDA-equivalent for PyTorch/Blender/etc). Skip \
+             if you only game.",
+        ));
+    }
+    if gpus.has_intel() && !installed_for_advisories.contains("intel-compute-runtime") {
+        findings.push(Finding::info(
+            "OpenCL for Intel not installed",
+            "Intel GPU compute workloads (oneAPI, Blender, Resolve) require \
+             `intel-compute-runtime`. Skip if you only game.",
+        ));
+    }
+
     // 4. Dangling Vulkan ICD JSONs — library_path points to a file that doesn't exist.
     //    Common cause: user removed an AMDVLK package but a stale JSON stayed behind,
     //    or a manual `ninja install` clobbered and then got rolled back. Not

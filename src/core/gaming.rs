@@ -50,6 +50,11 @@ const ALWAYS_ON_GAMING_PACKAGES: &[&str] = &[
     "lib32-gamemode",
     "mangohud",
     "lib32-mangohud",
+    // Phase 23: MangoHud's GTK configuration UI. Every MangoHud user ends up wanting
+    // a way to toggle overlays without hand-editing ~/.config/MangoHud/MangoHud.conf;
+    // goverlay is the standard front-end. Tiny (Pascal/Lazarus) — adds no meaningful
+    // install overhead.
+    "goverlay",
 ];
 
 /// Gaming setup is Applied when: `[multilib]` is enabled AND every required repo package
@@ -341,6 +346,15 @@ pub fn resolve_gaming_packages(gpus: &GpuInventory, form: FormFactor) -> Vec<Str
         }
     }
     if gpus.has_amd() {
+        // Phase 23: the 32-bit OpenGL runtime is required for classic Steam/Proton
+        // titles that don't use Vulkan. The Arch Wiki AMDGPU install page
+        // explicitly calls for `mesa` + `lib32-mesa`. Pre-Phase-23 we installed
+        // lib32-vulkan-radeon (Vulkan userspace) but NOT lib32-mesa (GL
+        // userspace), breaking older Steam library titles. `mesa` is usually
+        // already present via base deps but explicit install is idempotent under
+        // `pacman -S --needed`.
+        add("mesa");
+        add("lib32-mesa");
         // RADV (vulkan-radeon) is Mesa's Vulkan driver — faster and more widely
         // tested in Proton than AMD's own AMDVLK. Sanitation code warns if the
         // user has amdvlk/lib32-amdvlk installed alongside.
@@ -352,6 +366,10 @@ pub fn resolve_gaming_packages(gpus: &GpuInventory, form: FormFactor) -> Vec<Str
         add("lib32-libva-mesa-driver");
     }
     if gpus.has_intel() {
+        // Phase 23: same 32-bit-OpenGL-runtime rationale as AMD above. Intel
+        // users hit the same broken-Steam-titles bug on pre-Phase-23 tool runs.
+        add("mesa");
+        add("lib32-mesa");
         add("vulkan-intel");
         add("lib32-vulkan-intel");
         // Phase 15: intel-media-driver (iHD) is the modern Gen8+ VA-API driver.
@@ -423,6 +441,23 @@ pub fn sanitation_warnings_from_installed(
         });
     }
 
+    // Phase 23: AMD DDX analogue — `xf86-video-amdgpu` is the old DDX-era Xorg driver
+    // for amdgpu-class cards. The Arch Wiki AMDGPU page explicitly recommends the
+    // generic `modesetting` driver (shipped in xorg-server) as the default, with DDX
+    // only needed for TearFree or pre-GCN edge cases. DDX has no Wayland story and is
+    // known to cause tearing on recent Mesa/kernel combinations.
+    if gpus.has_amd() && installed.contains("xf86-video-amdgpu") {
+        out.push(SanitationWarning {
+            title: "Legacy xf86-video-amdgpu DDX installed".into(),
+            detail: "`xf86-video-amdgpu` is the old DDX-era Xorg driver. The modesetting driver \
+                     (shipped in xorg-server) is the modern replacement for amdgpu-class cards \
+                     on both Xorg and Wayland. Unless you specifically need TearFree on a \
+                     pre-GCN card, you don't want this package installed."
+                .into(),
+            remediation: "sudo pacman -Rns xf86-video-amdgpu".into(),
+        });
+    }
+
     // Mesa 25 legacy — VDPAU for the Gallium drivers (AMD / Intel / Nouveau) was
     // removed in Mesa 25. The `mesa-vdpau` package still exists on Arch for
     // transition but no longer ships usable drivers; applications should use
@@ -453,6 +488,7 @@ pub fn sanitation_warnings(gpus: &GpuInventory) -> Vec<SanitationWarning> {
         "amdvlk",
         "lib32-amdvlk",
         "xf86-video-intel",
+        "xf86-video-amdgpu",
         "mesa-vdpau",
         "lib32-mesa-vdpau",
     ];
@@ -714,6 +750,9 @@ mod tests {
         assert!(pkgs.contains(&"vulkan-intel".to_string()));
         // Phase 15: Intel VA-API via intel-media-driver.
         assert!(pkgs.contains(&"intel-media-driver".to_string()));
+        // Phase 23: 32-bit OpenGL runtime for Intel — required for classic Steam titles.
+        assert!(pkgs.contains(&"mesa".to_string()));
+        assert!(pkgs.contains(&"lib32-mesa".to_string()));
     }
 
     #[test]
@@ -727,6 +766,34 @@ mod tests {
             !pkgs.iter().any(|p| p == "amdvlk"),
             "never recommend AMDVLK"
         );
+        // Phase 23: 32-bit OpenGL runtime for AMD — Arch Wiki AMDGPU install page
+        // explicitly calls for this. Without lib32-mesa, classic (non-Vulkan) Steam
+        // titles fall back to llvmpipe for 32-bit GL calls.
+        assert!(pkgs.contains(&"mesa".to_string()));
+        assert!(pkgs.contains(&"lib32-mesa".to_string()));
+    }
+
+    #[test]
+    fn nvidia_only_does_not_get_mesa_in_explicit_install_list() {
+        // Phase 23 invariant: NVIDIA-only hosts don't need `mesa` / `lib32-mesa` in the
+        // explicit install list because nvidia-utils provides its own GL stack and
+        // libglvnd dispatches correctly. Mesa may still be present transitively via
+        // `vulkan-icd-loader` optdepends — that's fine and out of this test's scope.
+        let pkgs = resolve_gaming_packages(
+            &inv(vec![nvidia(NvidiaGeneration::Ada, 0x2684)]),
+            FormFactor::Desktop,
+        );
+        assert!(
+            !pkgs.iter().any(|p| p == "mesa" || p == "lib32-mesa"),
+            "NVIDIA-only host should not have mesa explicitly installed: {pkgs:?}"
+        );
+    }
+
+    #[test]
+    fn always_on_set_includes_goverlay() {
+        // Phase 23: MangoHud GUI. Every host (NVIDIA / AMD / Intel) gets it.
+        let pkgs = resolve_gaming_packages(&inv(vec![intel(0x64a0)]), FormFactor::Laptop);
+        assert!(pkgs.contains(&"goverlay".to_string()));
     }
 
     #[test]
@@ -925,6 +992,29 @@ Include = /etc/pacman.d/mirrorlist
             &installed_set(&["xf86-video-intel"]),
         );
         assert!(w.iter().any(|x| x.title.contains("xf86-video-intel")));
+    }
+
+    // Phase 23: xf86-video-amdgpu sanitation analogue. The modesetting driver is the
+    // wiki-recommended default for amdgpu-class cards on both Xorg and Wayland.
+    #[test]
+    fn sanitation_flags_xf86_video_amdgpu_on_amd_host() {
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![amd(0x73bf)]),
+            &installed_set(&["xf86-video-amdgpu"]),
+        );
+        assert!(w.iter().any(|x| x.title.contains("xf86-video-amdgpu")));
+    }
+
+    #[test]
+    fn sanitation_ignores_xf86_video_amdgpu_on_non_amd_host() {
+        // Unusual but possible: user has the package installed on an Intel-only host.
+        // Not our concern — the warning is specifically "you have AMD and this legacy
+        // package on top of it"; unrelated hosts don't get noise.
+        let w = sanitation_warnings_from_installed(
+            &inv(vec![intel(0x64a0)]),
+            &installed_set(&["xf86-video-amdgpu"]),
+        );
+        assert!(w.iter().all(|x| !x.title.contains("xf86-video-amdgpu")));
     }
 
     #[test]
