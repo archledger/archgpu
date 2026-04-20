@@ -81,6 +81,7 @@ archgpu --diagnose                # 14-point issue scan with remediation hints
 archgpu --dry-run --apply-all
 
 # Apply individual areas
+sudo archgpu --apply-groups       # add invoking user to video + render (re-login to activate)
 sudo archgpu --apply-wayland      # env drop-in + initramfs modules + PRIME (hybrid)
 sudo archgpu --apply-bootloader   # GPU-aware cmdline + per-bootloader regeneration
 sudo archgpu --apply-power        # suspend services + modprobe + nouveau blacklist
@@ -119,6 +120,7 @@ The live-kernel probe reads `/sys/module/nvidia_drm/parameters/{modeset,fbdev}`,
 | `src/core/wayland.rs` | Modern comment-only profile.d drop-in, `MODULES+=()` mkinitcpio drop-in (HOOKS untouched), hybrid PRIME Xorg config, sanitation scanner for `/etc/X11/xorg.conf` + `WLR_NO_HARDWARE_CURSORS` + global `GBM_BACKEND=nvidia-drm` |
 | `src/core/power.rs` | modprobe drop-in (universal + laptop-specific options), nouveau blacklist, `systemctl enable` of nvidia-suspend/hibernate/resume |
 | `src/core/gaming.rs` | `[multilib]` state-machine uncommenter, GPU-aware package resolver (`resolve_gaming_packages` + `resolve_aur_packages`), sanitation scanner for AMDVLK / `xf86-video-intel` / `mesa-vdpau`, `vm.max_map_count` sysctl |
+| `src/core/groups.rs` (Phase 27) | Provision invoking user's membership in `video` + `render` via `usermod -aG`. Re-login (NOT reboot) required for the change to reach the current session — surfaced in the Apply-time detail message. Pure parser for `/etc/group` + getent-style runtime probe. |
 | `src/core/aur.rs` | Helper detection (yay / paru), `invoking_user` via `SUDO_USER` / `PKEXEC_UID` + allowlist, manual `yay-bin` bootstrap (git clone + `makepkg` as user → `pacman -U` as root), `SUDO_ASKPASS` routing per DE |
 | `src/core/prime.rs` | Xorg `OutputClass` drop-in for hybrid GPUs (skipped when nvidia-utils ships its own) |
 | `src/core/diagnostics.rs` | 14-point read-only scanner, `Finding{severity,title,detail,fix_hint}`, surfaces gaming + wayland sanitation warnings |

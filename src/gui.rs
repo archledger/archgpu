@@ -217,6 +217,10 @@ pub fn run() -> Result<()> {
                 power: ui.get_opt_power(),
                 gaming: ui.get_opt_gaming(),
                 repair: ui.get_opt_repair(),
+                // Phase 27: groups toggle isn't yet wired into the Slint UI
+                // (deferred to the consolidated Phase 30 GUI PR). CLI
+                // `--apply-groups` and `--apply-all` paths remain authoritative.
+                groups: false,
             };
             if !actions.any() {
                 append_log(&ui, "No actions selected — nothing to do.");

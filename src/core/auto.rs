@@ -1,5 +1,6 @@
 use crate::core::gaming;
 use crate::core::gpu::GpuInventory;
+use crate::core::groups;
 use crate::core::hardware::FormFactor;
 use crate::core::{bootloader, power, repair, wayland, Actions, Context};
 
@@ -32,6 +33,9 @@ pub fn recommend(ctx: &Context, form: FormFactor, gpus: &GpuInventory) -> Action
         // Phase 20: Auto-Optimize recommends repair whenever the scanner finds stale
         // artifacts. Universally applicable, so the only gate is state.
         repair: repair::check_state(ctx, gpus, form).is_unapplied(),
+        // Phase 27: groups is universal for any host with a non-root invoking user.
+        // Incompatible (no SUDO_USER / PKEXEC_UID) → not recommended.
+        groups: groups::check_state(ctx).is_unapplied(),
     }
 }
 
@@ -41,6 +45,11 @@ pub fn recommended_names(actions: Actions) -> Vec<&'static str> {
     // Repair first — matches run_actions dispatch order and flags the urgent case visibly.
     if actions.repair {
         out.push("repair");
+    }
+    // Phase 27: groups runs after repair, before vendor stages — matches
+    // run_actions dispatch.
+    if actions.groups {
+        out.push("groups");
     }
     if actions.wayland {
         out.push("wayland");
@@ -214,6 +223,7 @@ mod tests {
             power: true,
             gaming: false,
             repair: false,
+            groups: false,
         };
         assert_eq!(recommended_names(actions), vec!["wayland", "power"]);
     }
@@ -228,7 +238,27 @@ mod tests {
             power: false,
             gaming: true,
             repair: true,
+            groups: false,
         };
         assert_eq!(recommended_names(actions), vec!["repair", "wayland", "gaming"]);
+    }
+
+    #[test]
+    fn recommended_names_places_groups_between_repair_and_wayland() {
+        // Phase 27: groups slots in right after repair so the live log reads
+        // chronologically — repair (config cleanup) → groups (user provisioning) →
+        // vendor-specific stages.
+        let actions = Actions {
+            wayland: true,
+            bootloader: false,
+            power: false,
+            gaming: false,
+            repair: true,
+            groups: true,
+        };
+        assert_eq!(
+            recommended_names(actions),
+            vec!["repair", "groups", "wayland"]
+        );
     }
 }

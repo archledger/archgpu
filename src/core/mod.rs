@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod diagnostics;
 pub mod gaming;
 pub mod gpu;
+pub mod groups;
 pub mod hardware;
 pub mod nvidia;
 pub mod power;
@@ -59,6 +60,9 @@ pub struct SystemPaths {
     // <sys_module>/<module>/ directory means the kernel module isn't loaded, which is the
     // same signal as "module loaded but parameter reports wrong value" for our purposes.
     pub sys_module: PathBuf,
+    // Phase 27: `/etc/group` — authoritative static group membership (the file logind
+    // dynamic-seat membership LAYERS on top of, not a replacement for).
+    pub group_file: PathBuf,
     // Phase 11: multi-bootloader paths
     pub grub_default: PathBuf,
     pub grub_cfg: PathBuf,
@@ -87,6 +91,7 @@ impl SystemPaths {
             vulkan_icd_dir: PathBuf::from("/usr/share/vulkan/icd.d"),
             backup_dir: PathBuf::from("/var/backups/archgpu"),
             sys_module: PathBuf::from("/sys/module"),
+            group_file: PathBuf::from("/etc/group"),
             grub_default: PathBuf::from("/etc/default/grub"),
             grub_cfg: PathBuf::from("/boot/grub/grub.cfg"),
             sdb_loader_conf: PathBuf::from("/boot/loader/loader.conf"),
@@ -121,6 +126,7 @@ impl SystemPaths {
             vulkan_icd_dir: root.join("usr/share/vulkan/icd.d"),
             backup_dir: root.join("var/backups/archgpu"),
             sys_module: root.join("sys/module"),
+            group_file: root.join("etc/group"),
             grub_default: root.join("etc/default/grub"),
             grub_cfg: root.join("boot/grub/grub.cfg"),
             sdb_loader_conf: root.join("boot/loader/loader.conf"),
@@ -171,6 +177,10 @@ pub struct Actions {
     /// failed to build. Runs BEFORE the other actions so their state probes see a
     /// clean system. Idempotent — on a healthy host it's a no-op.
     pub repair: bool,
+    /// Phase 27: ensure the invoking user is a member of `video` + `render` via
+    /// `usermod -aG`. Requires a re-login (not a reboot) to take effect in the
+    /// current session — surfaced in the apply-time detail message.
+    pub groups: bool,
 }
 
 impl Actions {
@@ -181,11 +191,17 @@ impl Actions {
             power: true,
             gaming: true,
             repair: true,
+            groups: true,
         }
     }
 
     pub fn any(&self) -> bool {
-        self.wayland || self.bootloader || self.power || self.gaming || self.repair
+        self.wayland
+            || self.bootloader
+            || self.power
+            || self.gaming
+            || self.repair
+            || self.groups
     }
 }
 
@@ -209,6 +225,15 @@ pub fn run_actions(
     if actions.repair {
         for r in repair::apply(ctx, gpus, form, assume_yes, progress)? {
             out.push(("repair", r));
+        }
+    }
+
+    // Phase 27: group provisioning runs before the pacman-heavy stages. It's a cheap
+    // operation (one usermod call) and keeps the output stream tidy — the user sees
+    // "added to video,render" once, not interleaved with pacman progress.
+    if actions.groups {
+        for r in groups::apply(ctx, assume_yes, progress)? {
+            out.push(("groups", r));
         }
     }
 
