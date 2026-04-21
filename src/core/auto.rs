@@ -32,6 +32,10 @@ pub fn recommend(ctx: &Context, form: FormFactor, gpus: &GpuInventory) -> Action
         // Phase 20: Auto-Optimize recommends repair whenever the scanner finds stale
         // artifacts. Universally applicable, so the only gate is state.
         repair: repair::check_state(ctx, gpus, form).is_unapplied(),
+        // Phase 29 invariant: troubleshoot is opt-in only. Auto-recommend never
+        // turns it on — recipes are subprocess-heavy (glxinfo / vulkaninfo /
+        // mkinitcpio) and meant for explicit "fix my broken graphics" invocation.
+        troubleshoot: false,
     }
 }
 
@@ -53,6 +57,10 @@ pub fn recommended_names(actions: Actions) -> Vec<&'static str> {
     }
     if actions.gaming {
         out.push("gaming");
+    }
+    // Phase 29: troubleshoot dispatches LAST, after all converge stages.
+    if actions.troubleshoot {
+        out.push("troubleshoot");
     }
     out
 }
@@ -214,6 +222,7 @@ mod tests {
             power: true,
             gaming: false,
             repair: false,
+            troubleshoot: false,
         };
         assert_eq!(recommended_names(actions), vec!["wayland", "power"]);
     }
@@ -228,7 +237,35 @@ mod tests {
             power: false,
             gaming: true,
             repair: true,
+            troubleshoot: false,
         };
         assert_eq!(recommended_names(actions), vec!["repair", "wayland", "gaming"]);
+    }
+
+    #[test]
+    fn auto_recommend_never_includes_troubleshoot() {
+        // Phase 29 invariant — opt-in only.
+        let tmp = tempdir().unwrap();
+        seed_pacman(tmp.path(), MULTILIB_OFF);
+        seed_cmdline_uki(tmp.path(), "rw quiet\n");
+        let ctx = Context::rooted_for_test(tmp.path(), ExecutionMode::DryRun);
+        let rec = recommend(&ctx, FormFactor::Laptop, &nvidia_hybrid());
+        assert!(!rec.troubleshoot);
+    }
+
+    #[test]
+    fn recommended_names_places_troubleshoot_last() {
+        let actions = Actions {
+            wayland: true,
+            bootloader: false,
+            power: false,
+            gaming: true,
+            repair: true,
+            troubleshoot: true,
+        };
+        assert_eq!(
+            recommended_names(actions),
+            vec!["repair", "wayland", "gaming", "troubleshoot"]
+        );
     }
 }

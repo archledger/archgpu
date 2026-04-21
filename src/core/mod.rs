@@ -12,6 +12,7 @@ pub mod prime;
 pub mod rendering;
 pub mod repair;
 pub mod state;
+pub mod troubleshoot;
 pub mod wayland;
 
 #[cfg(test)]
@@ -171,9 +172,17 @@ pub struct Actions {
     /// failed to build. Runs BEFORE the other actions so their state probes see a
     /// clean system. Idempotent — on a healthy host it's a no-op.
     pub repair: bool,
+    /// Phase 29: smart troubleshoot loop. Runs each registered Recipe through its
+    /// detect → fix → verify cycle. Opt-in only (not in `Actions::all()`, not in
+    /// `auto::recommend`) — the recipes spawn external probes (glxinfo,
+    /// vulkaninfo, mkinitcpio) that are too expensive for an unprompted run.
+    pub troubleshoot: bool,
 }
 
 impl Actions {
+    /// Phase 28+29 invariant: `cleanup` and `troubleshoot` are NOT in `all()`.
+    /// `--apply-all` must remain a safe-to-invoke fast path — cleanup is destructive
+    /// and troubleshoot fans out to subprocess probes that take noticeable time.
     pub fn all() -> Self {
         Self {
             wayland: true,
@@ -181,11 +190,17 @@ impl Actions {
             power: true,
             gaming: true,
             repair: true,
+            troubleshoot: false,
         }
     }
 
     pub fn any(&self) -> bool {
-        self.wayland || self.bootloader || self.power || self.gaming || self.repair
+        self.wayland
+            || self.bootloader
+            || self.power
+            || self.gaming
+            || self.repair
+            || self.troubleshoot
     }
 }
 
@@ -246,6 +261,15 @@ pub fn run_actions(
     if actions.gaming {
         for r in gaming::apply(ctx, gpus, form, assume_yes, progress)? {
             out.push(("gaming", r));
+        }
+    }
+    // Phase 29: troubleshoot runs LAST so any prior install/repair stages have had
+    // a chance to converge the host first. Recipes that DON'T match (the common
+    // case on a healthy box) are no-ops. Recipes that DO match write fixes and
+    // re-verify in-place.
+    if actions.troubleshoot {
+        for r in troubleshoot::apply(ctx, gpus, assume_yes, progress)? {
+            out.push(("troubleshoot", r));
         }
     }
     Ok(out)

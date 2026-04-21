@@ -49,7 +49,15 @@ pub struct Cli {
     #[arg(long)]
     pub apply_repair: bool,
 
-    /// Run every apply action
+    /// Phase 29: smart troubleshoot loop. Runs each registered Recipe through
+    /// detect → fix → verify. Pair with --dry-run to detect+explain without
+    /// writing fixes. Recipes: nomodeset_stuck, nouveau_active_with_nvidia,
+    /// dangling_vulkan_icd, software_rendering (diagnostic-only).
+    #[arg(long)]
+    pub apply_troubleshoot: bool,
+
+    /// Run every apply action (NOTE: does NOT include --apply-troubleshoot;
+    /// recipes spawn external probes and are explicit-opt-in only)
     #[arg(long)]
     pub apply_all: bool,
 
@@ -73,6 +81,7 @@ impl Cli {
             || self.apply_power
             || self.apply_gaming
             || self.apply_repair
+            || self.apply_troubleshoot
             || self.apply_all
     }
 
@@ -94,7 +103,11 @@ impl Cli {
 
     fn actions(&self) -> Actions {
         if self.apply_all {
-            return Actions::all();
+            // --apply-all + --apply-troubleshoot is valid — user explicitly opted
+            // both in. all() leaves troubleshoot off; merge it in here.
+            let mut a = Actions::all();
+            a.troubleshoot = self.apply_troubleshoot;
+            return a;
         }
         Actions {
             wayland: self.apply_wayland,
@@ -102,6 +115,7 @@ impl Cli {
             power: self.apply_power,
             gaming: self.apply_gaming,
             repair: self.apply_repair,
+            troubleshoot: self.apply_troubleshoot,
         }
     }
 }

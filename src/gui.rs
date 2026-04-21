@@ -217,6 +217,10 @@ pub fn run() -> Result<()> {
                 power: ui.get_opt_power(),
                 gaming: ui.get_opt_gaming(),
                 repair: ui.get_opt_repair(),
+                // Phase 29: troubleshoot card lands in the Phase 30 GUI PR with
+                // a per-recipe results table. Until then CLI --apply-troubleshoot
+                // is the only entry point.
+                troubleshoot: false,
             };
             if !actions.any() {
                 append_log(&ui, "No actions selected — nothing to do.");
