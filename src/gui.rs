@@ -402,6 +402,19 @@ fn apply_tweak_states(ui: &MainWindow, ctx: &Context, gpus: &GpuInventory, form:
     // troubleshoot has no Active state by design — recipes can always run; each
     // recipe reports its own per-run verification into the console.
 
+    // Phase 30 audit M6: pre-arm the Essentials and Groups toggles at startup
+    // so the GUI opens in the same state Auto-Optimize would produce. Only
+    // when check_state says Unapplied — Active-state tweaks stay off so the
+    // green "✓ Active" badge renders. Cleanup and troubleshoot remain off
+    // (opt-in invariant from Phases 28/29).
+    let rec = auto::recommend(ctx, form, gpus);
+    if rec.essentials {
+        ui.set_opt_essentials(true);
+    }
+    if rec.groups {
+        ui.set_opt_groups(true);
+    }
+
     // Phase 20 + UI overhaul: repair tweak — Active iff scanner finds nothing to heal.
     // The UI renders a green health pill in the hero when clean, a red-amber Attention
     // card below Hardware when not. `repair_summaries` feeds the bullets inside that card

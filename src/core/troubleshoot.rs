@@ -292,7 +292,20 @@ impl Recipe for NouveauActiveWithNvidia {
         if !gpus.has_nvidia() {
             return Ok(no_match(self.id(), self.title()));
         }
-        let nvidia_installed = pacman_pkg_installed("nvidia-utils");
+        // Phase 30 audit H1: check every NVIDIA utils branch, not just the
+        // current one. Kepler hosts run `nvidia-470xx-utils`; Fermi runs
+        // `nvidia-390xx-utils`; Maxwell/Volta/Pascal use `nvidia-580xx-utils`.
+        // Matching only `nvidia-utils` silently missed legacy-driver users —
+        // exactly the population most likely to have nouveau still active
+        // because their hardware is the hardest to configure correctly.
+        let nvidia_installed = [
+            "nvidia-utils",
+            "nvidia-580xx-utils",
+            "nvidia-470xx-utils",
+            "nvidia-390xx-utils",
+        ]
+        .iter()
+        .any(|p| pacman_pkg_installed(p));
         let nouveau_loaded = ctx.paths.sys_module.join("nouveau").exists();
         if !(nvidia_installed && nouveau_loaded) {
             return Ok(no_match(self.id(), self.title()));
@@ -332,7 +345,17 @@ impl Recipe for NouveauActiveWithNvidia {
         progress("[mkinitcpio] -P");
         let status = run_streaming(cmd, |line| progress(&format!("[mkinitcpio] {line}")))?;
         if !status.success() {
-            anyhow::bail!("mkinitcpio -P exited with {status}");
+            // Phase 30 audit M7: roll back the blacklist write if initramfs
+            // rebuild fails. Leaving the blacklist on disk without a refreshed
+            // initramfs produces a boot where nouveau is blacklisted late
+            // (after early-KMS already grabbed the console) AND the proprietary
+            // NVIDIA modules still aren't in initramfs — strictly worse than
+            // either standalone state.
+            let _ = std::fs::remove_file(&blacklist_path);
+            anyhow::bail!(
+                "mkinitcpio -P exited with {status} — rolled back blacklist write to avoid \
+                 leaving the system in a mixed state"
+            );
         }
 
         // Live-verify: nouveau won't unload from a running session. Always PendingReboot.
@@ -494,12 +517,15 @@ impl Recipe for SoftwareRendering {
                      modules not loaded (after pacman kernel upgrade without reboot), or \
                      `nomodeset` on the cmdline."
             .to_string();
-        // Diagnostic-only — too many root causes to safely auto-fix. The other recipes
-        // in this batch handle the deterministic fixes; this one points the user there.
-        let next_steps = "Run, in order: `archgpu --diagnose` (see specific cause), then \
-                          `archgpu --apply-essentials` (vendor ICDs), `archgpu --apply-groups` \
-                          (render group), `archgpu --apply-troubleshoot` (auto-fixes other \
-                          recipes detect)."
+        // Diagnostic-only — too many root causes to safely auto-fix. The other
+        // recipes in this batch handle the deterministic fixes; this one points
+        // the user there.
+        // Phase 30 audit L5: do NOT advise re-running `--apply-troubleshoot` —
+        // the user is running it right now, so the advice would be circular.
+        let next_steps = "Run, in order: `archgpu --diagnose` (pinpoint the specific cause), \
+                          then `archgpu --apply-essentials` (vendor ICDs + Mesa) and \
+                          `archgpu --apply-groups` (render group). The other recipes in this \
+                          troubleshoot run will already have handled any deterministic fixes."
             .to_string();
         Ok(RecipeReport {
             id: self.id(),

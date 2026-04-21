@@ -66,6 +66,12 @@ pub const NEVER_REMOVE: &[&str] = &[
     "linux-rt",
     "linux-rt-lts",
     "linux-firmware",
+    // Phase 30 audit M1: the split firmware packages are too load-bearing to let
+    // a transient detection glitch or swapped-hardware-pre-reboot state remove
+    // them. Their cost (few MB) is trivial relative to the "GPU fails to bring up
+    // after boot" cost of removing them by mistake.
+    "linux-firmware-amdgpu",
+    "linux-firmware-intel",
     "base",
     "base-devel",
     "systemd",
@@ -157,10 +163,14 @@ const NVIDIA_VENDOR_PACKAGES: &[&str] = &[
     "cuda-tools",
 ];
 
+// Phase 30 audit M1: `linux-firmware-amdgpu` / `linux-firmware-intel` are
+// deliberately NOT in the per-vendor candidate lists. They live in NEVER_REMOVE
+// as defense-in-depth — small package, mostly-safe-to-keep, and load-bearing
+// at boot for some configurations. A user who adds the matching GPU later
+// shouldn't have to reinstall firmware.
 const AMD_VENDOR_PACKAGES: &[&str] = &[
     "vulkan-radeon",
     "lib32-vulkan-radeon",
-    "linux-firmware-amdgpu",
     "rocm-opencl-runtime",
     "rocm-hip-runtime",
     "rocm-opencl-sdk",
@@ -173,7 +183,6 @@ const AMD_VENDOR_PACKAGES: &[&str] = &[
 const INTEL_VENDOR_PACKAGES: &[&str] = &[
     "vulkan-intel",
     "lib32-vulkan-intel",
-    "linux-firmware-intel",
     "intel-media-driver",
     "libva-intel-driver",
     "intel-compute-runtime",
@@ -206,13 +215,18 @@ const DEFUNCT_PACKAGES: &[&str] = &[
 /// AMDVLK pair — only flagged for removal when `vulkan-radeon` (RADV) is also installed.
 const AMDVLK_PACKAGES: &[&str] = &["amdvlk", "lib32-amdvlk"];
 
-/// Cleanup state probe. Currently unused by `auto::recommend` (Phase 28 invariant —
-/// cleanup is opt-in only) but exposed for the Phase 30 GUI card, which uses it
-/// to decide whether the Cleanup card shows "0 candidates / system already converged"
-/// or "N packages can be removed — Preview".
-#[allow(dead_code)]
+/// Cleanup state probe. Used by the Phase 30 GUI card to decide whether the
+/// Cleanup card shows "0 candidates / system already converged" or "N packages
+/// can be removed — Preview".
 pub fn check_state(ctx: &Context, gpus: &GpuInventory) -> TweakState {
     let _ = ctx;
+    // Phase 30 audit C1: refuse to classify when the GPU inventory is empty —
+    // `lspci` failed or `pciutils` is missing. Otherwise every vendor package
+    // gets flagged HardwareAbsent and the GUI would invite the user to wipe
+    // their entire driver stack.
+    if gpus.gpus.is_empty() {
+        return TweakState::Incompatible;
+    }
     let Some(installed) = pacman_query_installed_set() else {
         // pacman unavailable — leave callable; apply will surface the real error.
         return TweakState::Unapplied;
@@ -231,6 +245,18 @@ pub fn apply(
     assume_yes: bool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Vec<ChangeReport>> {
+    // Phase 30 audit C1: hardware-absent classification is only meaningful when
+    // we actually detected some hardware. If lspci returned nothing (detection
+    // failed, pciutils missing, running in a container without /sys), refuse
+    // to run — otherwise every vendor package on disk would be flagged for
+    // removal.
+    if gpus.gpus.is_empty() {
+        return Ok(vec![ChangeReport::AlreadyApplied {
+            detail: "GPU inventory empty — refusing to classify hardware-absent packages. \
+                     Install `pciutils` and verify `lspci` works, then retry."
+                .into(),
+        }]);
+    }
     let installed = pacman_query_installed_set()
         .context("querying pacman -Qq for currently installed packages")?;
     let plan = compute_removal_plan(gpus, &installed);
@@ -444,6 +470,15 @@ fn write_pre_cleanup_snapshot(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // Phase 30 audit M2: a pacman -Rns with no functioning rollback is worse than
+    // refusing to run. If the body somehow came out empty, bail before any
+    // removal so the caller sees a clear error instead of a useless snapshot.
+    if body.trim().is_empty() {
+        anyhow::bail!(
+            "pre-cleanup snapshot would be empty — refusing to proceed with `pacman -Rns`. \
+             Check that `pacman -Qq` produces output."
+        );
+    }
     atomic_write(&path, &body)?;
     Ok(path)
 }
@@ -574,6 +609,63 @@ mod tests {
             &installed(&[]),
         );
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn split_firmware_packages_protected_by_never_remove() {
+        // Phase 30 audit M1: linux-firmware-amdgpu and linux-firmware-intel are
+        // load-bearing at boot for many GPUs. Even on a host where the matching
+        // vendor is absent, we deliberately keep them. They live in NEVER_REMOVE
+        // and are NOT in the per-vendor candidate lists at all — neither path
+        // can plan their removal.
+        let never: HashSet<&'static str> = NEVER_REMOVE.iter().copied().collect();
+        assert!(never.contains("linux-firmware-amdgpu"));
+        assert!(never.contains("linux-firmware-intel"));
+
+        let plan = compute_removal_plan(
+            &inv(vec![gpu(GpuVendor::Nvidia, 0x2204)]), // no AMD, no Intel
+            &installed(&["linux-firmware-amdgpu", "linux-firmware-intel"]),
+        );
+        assert!(
+            !plan.iter().any(|c| c.package == "linux-firmware-amdgpu"),
+            "split firmware must never be queued for removal: {plan:?}"
+        );
+        assert!(!plan.iter().any(|c| c.package == "linux-firmware-intel"));
+    }
+
+    #[test]
+    fn check_state_returns_incompatible_on_empty_gpu_inventory() {
+        // Phase 30 audit C1: this is the safety guard against a destructive
+        // misclassification. If detection ever returns an empty inventory,
+        // every vendor package would otherwise be flagged HardwareAbsent.
+        // check_state must report Incompatible (renders the orange "Unsupported"
+        // badge in the GUI and skips Auto-Optimize even though cleanup is
+        // already opt-in-only).
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context::rooted_for_test(tmp.path(), ExecutionMode::DryRun);
+        let state = check_state(&ctx, &GpuInventory::default());
+        assert_eq!(state, TweakState::Incompatible);
+    }
+
+    #[test]
+    fn apply_refuses_to_run_on_empty_gpu_inventory() {
+        // Phase 30 audit C1: matching guard in apply(). With --apply-cleanup
+        // --yes and a transient lspci failure, the previous behavior would
+        // silently queue every vendor package for `pacman -Rns` removal.
+        // Now we refuse cleanly with an actionable message.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context::rooted_for_test(tmp.path(), ExecutionMode::Apply);
+        let reports = apply(&ctx, &GpuInventory::default(), true, &mut |_| {}).unwrap();
+        assert_eq!(reports.len(), 1);
+        match &reports[0] {
+            ChangeReport::AlreadyApplied { detail } => {
+                assert!(
+                    detail.contains("GPU inventory empty"),
+                    "expected refusal message, got: {detail}"
+                );
+            }
+            other => panic!("expected AlreadyApplied refusal, got {other:?}"),
+        }
     }
 
     #[test]
